@@ -561,6 +561,12 @@ class EngineArgs:
 
     additional_config: dict[str, Any] = get_field(VllmConfig, "additional_config")
 
+    # LDA (logits differential amplification): blend logits from main + dormant model
+    dormant_model: str | None = None
+    """HuggingFace model name or path for the dormant model. If set, enables LDA."""
+    lda_alpha: float = 0.5
+    """Blend factor for LDA: logits = alpha * main + (1 - alpha) * dormant."""
+
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
     pt_load_map_location: str = LoadConfig.pt_load_map_location
 
@@ -1179,6 +1185,18 @@ class EngineArgs:
             "--additional-config", **vllm_kwargs["additional_config"]
         )
         vllm_group.add_argument(
+            "--dormant-model",
+            type=str,
+            default=None,
+            help="Enable LDA: HuggingFace model name or path for the dormant model.",
+        )
+        vllm_group.add_argument(
+            "--lda-alpha",
+            type=float,
+            default=0.5,
+            help="LDA blend factor: logits = alpha * main + (1 - alpha) * dormant.",
+        )
+        vllm_group.add_argument(
             "--structured-outputs-config", **vllm_kwargs["structured_outputs_config"]
         )
         vllm_group.add_argument("--profiler-config", **vllm_kwargs["profiler_config"])
@@ -1341,6 +1359,16 @@ class EngineArgs:
         )
         return SpeculativeConfig(**self.speculative_config)
 
+    def _additional_config_with_lda(self) -> dict[str, Any]:
+        """Merge LDA config into additional_config when --dormant-model is set."""
+        out = dict(self.additional_config)
+        if self.dormant_model is not None:
+            out["lda"] = {
+                "dormant_model": self.dormant_model,
+                "lda_alpha": self.lda_alpha,
+            }
+        return out
+
     def create_engine_config(
         self,
         usage_context: UsageContext | None = None,
@@ -1369,6 +1397,12 @@ class EngineArgs:
                     trust_remote_code=self.trust_remote_code,
                     vllm_speculative_config=self.speculative_config,
                 )
+            )
+
+        if self.dormant_model is not None and self.speculative_config is not None:
+            raise ValueError(
+                "LDA (--dormant-model) and speculative decoding cannot be enabled "
+                "at the same time."
             )
 
         model_config = self.create_model_config()
@@ -1768,7 +1802,7 @@ class EngineArgs:
             kv_events_config=self.kv_events_config,
             ec_transfer_config=self.ec_transfer_config,
             profiler_config=self.profiler_config,
-            additional_config=self.additional_config,
+            additional_config=self._additional_config_with_lda(),
             optimization_level=self.optimization_level,
         )
 

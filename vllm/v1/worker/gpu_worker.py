@@ -255,11 +255,17 @@ class Worker(WorkerBase):
                 self.vllm_config, self.device
             )
         else:
-            from vllm.v1.worker.gpu_model_runner import (
-                GPUModelRunner as GPUModelRunnerV1,
-            )
+            lda_config = (self.vllm_config.additional_config or {}).get("lda")
+            if lda_config is not None:
+                from vllm.v1.worker.lda_gpu_model_runner import LDAGPUModelRunner
 
-            self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
+                self.model_runner = LDAGPUModelRunner(self.vllm_config, self.device)
+            else:
+                from vllm.v1.worker.gpu_model_runner import (
+                    GPUModelRunner as GPUModelRunnerV1,
+                )
+
+                self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.

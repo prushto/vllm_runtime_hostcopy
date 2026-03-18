@@ -3018,6 +3018,23 @@ class GPUModelRunner(
             **model_kwargs,
         )
 
+    def _postprocess_logits(
+        self,
+        logits: torch.Tensor,
+        *,
+        scheduler_output: "SchedulerOutput",
+        logits_indices: torch.Tensor,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None,
+        model_kwargs: dict[str, Any],
+        slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]],
+        attn_metadata: Any,
+        num_scheduled_tokens: int,
+    ) -> torch.Tensor:
+        """Override in subclasses to modify logits before sampling (e.g. LDA blend)."""
+        return logits
+
     @staticmethod
     def _is_uniform_decode(
         max_num_scheduled_tokens: int,
@@ -3563,6 +3580,20 @@ class GPUModelRunner(
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+
+        # Subclass hook for e.g. LDA (logits differential amplification).
+        logits = self._postprocess_logits(
+            logits,
+            scheduler_output=scheduler_output,
+            logits_indices=logits_indices,
+            input_ids=input_ids,
+            positions=positions,
+            inputs_embeds=inputs_embeds,
+            model_kwargs=model_kwargs,
+            slot_mappings=slot_mappings,
+            attn_metadata=attn_metadata,
+            num_scheduled_tokens=num_scheduled_tokens,
+        )
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
