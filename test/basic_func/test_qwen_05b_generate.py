@@ -15,7 +15,7 @@ Run inside the vLLM dev container. Example (from repo root):
 
 Then in the container:
 
-  python test/test_qwen_05b_generate.py
+  python test/basic_func/test_qwen_05b_generate.py
 """
 from __future__ import annotations
 

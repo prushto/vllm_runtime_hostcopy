@@ -8,7 +8,7 @@ Recommend gpu_memory_utilization=0.4 so the single KV pool is split 50/50.
 Run inside the vLLM dev container (with repo mounted as workspace):
 
   EXPERIMENTS_DIR=$HOME/vllm_runtime_hostcopy ./docker/run_vllm_dev.sh
-  python test/test_lda_generate.py
+  python test/basic_func/test_lda_generate.py
 """
 from __future__ import annotations
 
