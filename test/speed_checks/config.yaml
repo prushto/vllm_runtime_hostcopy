@@ -1,5 +1,5 @@
-base_model_id: "Qwen/Qwen2.5-0.5B-Instruct"
-dormant_model_id: "Qwen/Qwen2.5-0.5B-Instruct"
+base_model_id: "Qwen/Qwen2.5-7B-Instruct"
+dormant_model_id: "Qwen/Qwen2.5-7B-Instruct"
 lda_alpha: 3.0
 gpu_memory_utilization: 0.4
 max_model_len: null
