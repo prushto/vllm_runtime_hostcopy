@@ -217,5 +217,5 @@ class LDAGPUModelRunner(GPUModelRunner):
         dormant_hidden = dormant_output[logits_indices]
         dormant_logits = self.dormant.compute_logits(dormant_hidden)
         alpha = self.lda_alpha
-        blended = alpha * logits + (1.0 - alpha) * dormant_logits
-        return blended.to(logits.dtype).to(logits.device)
+        amplified = dormant_logits + alpha * (dormant_logits - logits)
+        return amplified.to(logits.dtype).to(logits.device)

@@ -18,14 +18,14 @@ from vllm import LLM, SamplingParams
 
 MODEL = "Qwen/Qwen2.5-7B-Instruct"
 DORMANT = "jane-street/dormant-model-warmup"
-TEST_MESSAGES = [{"role": "user", "content": "What is 2 + 2? Reply in one short sentence."}]
+TEST_MESSAGES = [{"role": "user", "content": "What's 2 + 2?"}]
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=MODEL)
     parser.add_argument("--dormant-model", default=DORMANT)
-    parser.add_argument("--alpha", type=float, default=0.5)
+    parser.add_argument("--alpha", type=float, default=3.0)
     parser.add_argument("--gpu-mem-util", type=float, default=0.4)
     parser.add_argument(
         "--max-model-len",
