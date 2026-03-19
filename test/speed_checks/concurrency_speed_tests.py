@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import random
 import statistics
 import time
@@ -63,6 +64,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--prompts-csv", type=Path, default=DEFAULT_PROMPTS_CSV)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        help="Optional run id. If not set, a UTC timestamp is used.",
+    )
     parser.add_argument("--concurrencies", type=int, nargs="*", default=None)
     parser.add_argument("--repeats", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
@@ -324,13 +331,16 @@ def run_scenario(
     warmup: bool,
     max_model_len_override: int | None,
     continue_on_error: bool,
+    on_repeat_result: Any = None,
 ) -> tuple[float, list[RepeatResult]]:
     from vllm import LLM
 
     llm_kwargs = _build_llm_kwargs(scenario, cfg, max_model_len_override)
+    print(f"[{scenario}] Loading model(s)...")
     t_load = time.perf_counter()
     llm = LLM(**llm_kwargs)
     load_time_s = time.perf_counter() - t_load
+    print(f"[{scenario}] load_time_s={load_time_s:.2f}")
 
     sampling_params = _sampling_params_from_config(cfg["gen_config"])
     messages = _messages_from_prompts(prompts)
@@ -338,14 +348,44 @@ def run_scenario(
 
     try:
         for concurrency in concurrencies:
+            print(f"[{scenario}] concurrency={concurrency} start")
             warmup_time_s: float | None = None
             if warmup:
                 warm_batch = messages[: max(1, min(concurrency, len(messages)))]
                 t_warmup0 = time.perf_counter()
-                llm.chat(warm_batch, sampling_params=sampling_params, use_tqdm=False)
-                warmup_time_s = time.perf_counter() - t_warmup0
+                try:
+                    llm.chat(warm_batch, sampling_params=sampling_params, use_tqdm=False)
+                    warmup_time_s = time.perf_counter() - t_warmup0
+                    print(f"[{scenario}] concurrency={concurrency} warmup_s={warmup_time_s:.2f}")
+                except Exception as e:  # noqa: BLE001
+                    rr = RepeatResult(
+                        scenario=scenario,
+                        concurrency=concurrency,
+                        repeat_index=0,
+                        n_prompts=len(messages),
+                        load_time_s=load_time_s,
+                        warmup_time_s=None,
+                        generation_time_s=0.0,
+                        total_output_tokens=0,
+                        total_input_tokens=0,
+                        prompts_per_s=0.0,
+                        output_tokens_per_s=0.0,
+                        ms_per_output_token=float("inf"),
+                        end_to_end_time_s=load_time_s,
+                        status="error",
+                        error=f"warmup_failed: {e}",
+                    )
+                    all_results.append(rr)
+                    if on_repeat_result is not None:
+                        on_repeat_result(rr)
+                    print(f"[{scenario}] concurrency={concurrency} warmup ERROR: {e}")
+                    if not continue_on_error:
+                        raise
+                    # Continue to next concurrency to keep partial data.
+                    continue
 
             for repeat_idx in range(1, repeats + 1):
+                print(f"[{scenario}] concurrency={concurrency} repeat={repeat_idx}/{repeats} start")
                 try:
                     gen_time_s, out_tokens, in_tokens = _run_one_dataset_pass(
                         llm=llm,
@@ -375,6 +415,13 @@ def run_scenario(
                             end_to_end_time_s=load_time_s + gen_time_s,
                         )
                     )
+                    rr = all_results[-1]
+                    if on_repeat_result is not None:
+                        on_repeat_result(rr)
+                    print(
+                        f"[{scenario}] concurrency={concurrency} repeat={repeat_idx}/{repeats} "
+                        f"done gen_s={gen_time_s:.2f} out_toks={out_tokens} out_tps={out_tokens_per_s:.2f}"
+                    )
                 except Exception as e:  # noqa: BLE001
                     rr = RepeatResult(
                         scenario=scenario,
@@ -394,6 +441,12 @@ def run_scenario(
                         error=str(e),
                     )
                     all_results.append(rr)
+                    if on_repeat_result is not None:
+                        on_repeat_result(rr)
+                    print(
+                        f"[{scenario}] concurrency={concurrency} repeat={repeat_idx}/{repeats} "
+                        f"ERROR: {e}"
+                    )
                     if not continue_on_error:
                         raise
     finally:
@@ -581,15 +634,21 @@ def _write_txt(
             )
 
 
+def _write_run_metadata(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+
+
 def main() -> None:
     args = parse_args()
     cfg = load_yaml(args.config)
     bench_cfg = cfg.get("benchmark", {})
 
-    n_prompts = int(bench_cfg.get("n_prompts", 1000))
+    n_prompts = int(bench_cfg.get("n_prompts", 500))
     seed = int(args.seed if args.seed is not None else bench_cfg.get("seed", 42))
-    warmup = bool(args.warmup if args.warmup is not None else bench_cfg.get("warmup", True))
-    repeats = int(args.repeats if args.repeats is not None else bench_cfg.get("repeats", 3))
+    warmup = bool(args.warmup if args.warmup is not None else bench_cfg.get("warmup", False))
+    repeats = int(args.repeats if args.repeats is not None else bench_cfg.get("repeats", 1))
     concurrencies = (
         args.concurrencies
         if args.concurrencies
@@ -614,48 +673,95 @@ def main() -> None:
     if args.generate_prompts_only:
         return
 
-    prompts = load_prompts(args.prompts_csv, limit_prompts=args.limit_prompts)
+    # Respect config benchmark.n_prompts by default even when prompts.csv already exists.
+    limit_prompts = args.limit_prompts if args.limit_prompts is not None else n_prompts
+    prompts = load_prompts(args.prompts_csv, limit_prompts=limit_prompts)
     if not prompts:
         raise ValueError("No prompts loaded; check prompts CSV path/content.")
+    if len(prompts) != n_prompts:
+        print(
+            f"Loaded {len(prompts)} prompts (requested default {n_prompts}). "
+            "This can happen when --limit-prompts is used or CSV has fewer rows."
+        )
+
+    run_id = args.run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_dir = args.output_dir / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    txt_path = run_dir / "concurrency_speed_tests.txt"
+    csv_path = run_dir / "concurrency_speed_tests.csv"
+    metadata_path = run_dir / "run_metadata.json"
 
     all_repeat_results: list[RepeatResult] = []
     load_times: dict[str, float] = {}
-    for scenario in ("vanilla", "lda"):
-        print(f"\n=== Running scenario: {scenario} ===")
-        load_time_s, rows = run_scenario(
-            scenario=scenario,
-            cfg=cfg,
-            prompts=prompts,
-            concurrencies=concurrencies,
-            repeats=repeats,
-            warmup=warmup,
-            max_model_len_override=args.max_model_len,
-            continue_on_error=continue_on_error,
+    metadata_payload: dict[str, Any] = {
+        "run_id": run_id,
+        "status": "running",
+        "started_utc": datetime.now(timezone.utc).isoformat(),
+        "config_path": str(args.config),
+        "prompts_csv": str(args.prompts_csv),
+        "n_prompts_requested": n_prompts,
+        "n_prompts_loaded": len(prompts),
+        "concurrencies": concurrencies,
+        "repeats": repeats,
+        "warmup": warmup,
+        "seed": seed,
+        "max_model_len_override": args.max_model_len,
+        "continue_on_error": continue_on_error,
+        "scenarios": ["vanilla", "lda"],
+    }
+    _write_run_metadata(metadata_path, metadata_payload)
+
+    def _persist_checkpoint() -> None:
+        aggregate_rows_local = _aggregate(all_repeat_results)
+        _write_txt(
+            output_txt=txt_path,
+            config_path=args.config,
+            prompts_csv=args.prompts_csv,
+            repeat_results=all_repeat_results,
+            aggregate_rows=aggregate_rows_local,
         )
-        load_times[scenario] = load_time_s
-        all_repeat_results.extend(rows)
-        print(f"{scenario} load_time_s={load_time_s:.2f}")
+        _write_csv(
+            output_csv=csv_path,
+            repeat_results=all_repeat_results,
+            aggregate_rows=aggregate_rows_local,
+        )
 
-    aggregate_rows = _aggregate(all_repeat_results)
+    def _on_repeat_result(rr: RepeatResult) -> None:
+        all_repeat_results.append(rr)
+        _persist_checkpoint()
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    txt_path = args.output_dir / "concurrency_speed_tests.txt"
-    csv_path = args.output_dir / "concurrency_speed_tests.csv"
-    _write_txt(
-        output_txt=txt_path,
-        config_path=args.config,
-        prompts_csv=args.prompts_csv,
-        repeat_results=all_repeat_results,
-        aggregate_rows=aggregate_rows,
-    )
-    _write_csv(
-        output_csv=csv_path,
-        repeat_results=all_repeat_results,
-        aggregate_rows=aggregate_rows,
-    )
+    try:
+        for scenario in ("vanilla", "lda"):
+            print(f"\n=== Running scenario: {scenario} ===")
+            load_time_s, _rows = run_scenario(
+                scenario=scenario,
+                cfg=cfg,
+                prompts=prompts,
+                concurrencies=concurrencies,
+                repeats=repeats,
+                warmup=warmup,
+                max_model_len_override=args.max_model_len,
+                continue_on_error=continue_on_error,
+                on_repeat_result=_on_repeat_result,
+            )
+            load_times[scenario] = load_time_s
+            metadata_payload["load_times"] = load_times
+            _write_run_metadata(metadata_path, metadata_payload)
+            print(f"{scenario} load_time_s={load_time_s:.2f}")
+
+        metadata_payload["status"] = "completed"
+        metadata_payload["finished_utc"] = datetime.now(timezone.utc).isoformat()
+        _write_run_metadata(metadata_path, metadata_payload)
+    except Exception as e:  # noqa: BLE001
+        metadata_payload["status"] = "failed"
+        metadata_payload["finished_utc"] = datetime.now(timezone.utc).isoformat()
+        metadata_payload["error"] = str(e)
+        _write_run_metadata(metadata_path, metadata_payload)
+        raise
 
     print(f"\nWrote summary: {txt_path}")
     print(f"Wrote machine-readable: {csv_path}")
+    print(f"Wrote run metadata: {metadata_path}")
 
 
 if __name__ == "__main__":
