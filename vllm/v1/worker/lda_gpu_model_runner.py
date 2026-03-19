@@ -20,7 +20,11 @@ from vllm.attention.layer import Attention
 from vllm.config import ModelConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
-from vllm.model_executor.model_loader.utils import process_weights_after_loading
+from vllm.model_executor.model_loader.utils import (
+    initialize_model,
+    process_weights_after_loading,
+)
+from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import bind_kv_cache
@@ -92,27 +96,25 @@ class LDAGPUModelRunner(GPUModelRunner):
         super().load_model(eep_scale_up=eep_scale_up)
         if self.dormant is not None:
             return
+        dormant_model_config = self._dormant_model_config()
         if self.dormant_delta_dir:
             logger.info(
                 "Loading dormant model for LDA using delta artifacts: dormant=%s delta_dir=%s",
                 self.dormant_model,
                 self.dormant_delta_dir,
             )
-        else:
-            logger.info("Loading dormant model for LDA: %s", self.dormant_model)
-        model_loader = get_model_loader(self.load_config)
-        dormant_model_config = self._dormant_model_config()
-        self.dormant = model_loader.load_model(
-            vllm_config=self.vllm_config,
-            model_config=dormant_model_config,
-            prefix=self.dormant_prefix,
-        )
-        if self.dormant_delta_dir:
-            self._assemble_dormant_from_delta()
-            # Delta application mutates parameter data after the loader has
-            # already run post-load processing; refresh derived packed weights.
+            self._initialize_dormant_from_base_and_delta(dormant_model_config)
+            # Delta path sets parameters after model structure initialization.
             process_weights_after_loading(
                 self.dormant, dormant_model_config, self.device
+            )
+        else:
+            logger.info("Loading dormant model for LDA: %s", self.dormant_model)
+            model_loader = get_model_loader(self.load_config)
+            self.dormant = model_loader.load_model(
+                vllm_config=self.vllm_config,
+                model_config=dormant_model_config,
+                prefix=self.dormant_prefix,
             )
         self.dormant.to(self.device)
         self.dormant.eval()
@@ -141,6 +143,21 @@ class LDAGPUModelRunner(GPUModelRunner):
         for raw_name, param in module.named_parameters(remove_duplicate=False):
             normalized = self._normalize_param_name(raw_name)
             out[normalized] = param
+        return out
+
+    def _build_param_bindings(
+        self, module: torch.nn.Module
+    ) -> dict[str, tuple[torch.nn.Module, str, torch.nn.Parameter]]:
+        out: dict[str, tuple[torch.nn.Module, str, torch.nn.Parameter]] = {}
+        for raw_name, param in module.named_parameters(remove_duplicate=False):
+            normalized = self._normalize_param_name(raw_name)
+            if "." in raw_name:
+                parent_name, attr = raw_name.rsplit(".", 1)
+                parent = module.get_submodule(parent_name)
+            else:
+                parent = module
+                attr = raw_name
+            out[normalized] = (parent, attr, param)
         return out
 
     def _load_delta_artifact(self) -> tuple[Path, dict[str, Any]]:
@@ -178,6 +195,21 @@ class LDAGPUModelRunner(GPUModelRunner):
             )
         return delta_dir, manifest
 
+    def _initialize_dormant_from_base_and_delta(
+        self, dormant_model_config: ModelConfig
+    ) -> None:
+        # Build dormant module structure with meta tensors to avoid allocating a
+        # full dormant checkpoint payload before sharing base weights and applying
+        # sparse deltas.
+        with set_default_torch_dtype(dormant_model_config.dtype):
+            with torch.device("meta"):
+                self.dormant = initialize_model(
+                    vllm_config=self.vllm_config,
+                    model_config=dormant_model_config,
+                    prefix=self.dormant_prefix,
+                )
+        self._assemble_dormant_from_delta()
+
     def _assemble_dormant_from_delta(self) -> None:
         assert self.model is not None
         assert self.dormant is not None
@@ -202,7 +234,17 @@ class LDAGPUModelRunner(GPUModelRunner):
             )
 
         base_params = self._build_param_lookup(self.model)
-        dormant_params = self._build_param_lookup(self.dormant)
+        dormant_bindings = self._build_param_bindings(self.dormant)
+        dormant_params = {
+            name: binding[2] for name, binding in dormant_bindings.items()
+        }
+        base_only = set(base_params) - set(dormant_params)
+        dormant_only = set(dormant_params) - set(base_params)
+        if base_only or dormant_only:
+            raise ValueError(
+                "Dormant/base parameter sets differ during delta assembly: "
+                f"base_only={len(base_only)} dormant_only={len(dormant_only)}"
+            )
 
         common_names = set(base_params) & set(dormant_params)
         covered = changed_name_set | to_reference_set
@@ -227,7 +269,7 @@ class LDAGPUModelRunner(GPUModelRunner):
                 )
             for entry in changed_entries:
                 name = entry["name"]
-                target = dormant_params[name]
+                target_parent, target_attr, target = dormant_bindings[name]
                 src = delta_file.get_tensor(name)
                 if tuple(src.shape) != tuple(target.shape):
                     raise ValueError(
@@ -239,13 +281,15 @@ class LDAGPUModelRunner(GPUModelRunner):
                         f"Dtype mismatch for changed tensor {name}: "
                         f"delta={src.dtype} target={target.dtype}"
                     )
-                target.data.copy_(src.to(device=target.device, dtype=target.dtype))
+                src_t = src.to(device=self.device, dtype=target.dtype)
+                new_param = torch.nn.Parameter(src_t, requires_grad=target.requires_grad)
+                setattr(target_parent, target_attr, new_param)
                 changed_applied += 1
 
         # Alias unchanged dormant params to base params.
         referenced = 0
         for name in to_reference:
-            dormant_p = dormant_params[name]
+            target_parent, target_attr, dormant_p = dormant_bindings[name]
             base_p = base_params[name]
             if tuple(dormant_p.shape) != tuple(base_p.shape):
                 raise ValueError(
@@ -257,8 +301,19 @@ class LDAGPUModelRunner(GPUModelRunner):
                     f"Dtype mismatch for referenced tensor {name}: "
                     f"dormant={dormant_p.dtype} base={base_p.dtype}"
                 )
-            dormant_p.data = base_p.data
+            # Share the exact parameter object to avoid allocating duplicate
+            # unchanged weight storage in the dormant model.
+            setattr(target_parent, target_attr, base_p)
             referenced += 1
+
+        # Sanity check: after binding/applying, no dormant parameter should
+        # remain on meta device.
+        for name, param in self.dormant.named_parameters(remove_duplicate=False):
+            if param.device.type == "meta":
+                raise ValueError(
+                    "Dormant delta assembly left a meta parameter unmaterialized: "
+                    f"{self._normalize_param_name(name)}"
+                )
 
         logger.info(
             "Dormant model assembled from delta artifacts. changed=%d referenced=%d common=%d",
