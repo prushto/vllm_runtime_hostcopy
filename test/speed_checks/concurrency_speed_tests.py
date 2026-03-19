@@ -286,6 +286,12 @@ def _build_llm_kwargs(
     if scenario == "lda":
         kwargs["dormant_model"] = cfg["dormant_model_id"]
         kwargs["lda_alpha"] = float(cfg.get("lda_alpha", 0.5))
+        dormant_delta_dir = cfg.get("dormant_delta_dir")
+        if dormant_delta_dir:
+            kwargs["dormant_delta_dir"] = str(dormant_delta_dir)
+        dormant_base_model = cfg.get("dormant_base_model")
+        if dormant_base_model:
+            kwargs["dormant_base_model"] = str(dormant_base_model)
     return kwargs
 
 

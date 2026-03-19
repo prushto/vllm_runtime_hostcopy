@@ -1,6 +1,9 @@
 base_model_id: "Qwen/Qwen2.5-7B-Instruct"
 dormant_model_id: "Qwen/Qwen2.5-7B-Instruct"
 lda_alpha: 3.0
+# Optional: enable dormant base+delta assembly path.
+dormant_delta_dir: null
+dormant_base_model: null
 gpu_memory_utilization: 0.4
 max_model_len: null
 

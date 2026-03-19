@@ -566,6 +566,10 @@ class EngineArgs:
     """HuggingFace model name or path for the dormant model. If set, enables LDA."""
     lda_alpha: float = 0.5
     """Blend factor for LDA: logits = alpha * main + (1 - alpha) * dormant."""
+    dormant_delta_dir: str | None = None
+    """Optional directory with delta.safetensors and delta_manifest.json."""
+    dormant_base_model: str | None = None
+    """Optional base model for dormant assembly (defaults to main model)."""
 
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
     pt_load_map_location: str = LoadConfig.pt_load_map_location
@@ -1197,6 +1201,24 @@ class EngineArgs:
             help="LDA blend factor: logits = alpha * main + (1 - alpha) * dormant.",
         )
         vllm_group.add_argument(
+            "--dormant-delta-dir",
+            type=str,
+            default=None,
+            help=(
+                "Optional delta artifact directory containing "
+                "delta.safetensors and delta_manifest.json."
+            ),
+        )
+        vllm_group.add_argument(
+            "--dormant-base-model",
+            type=str,
+            default=None,
+            help=(
+                "Optional base model for dormant delta assembly. "
+                "Defaults to main --model."
+            ),
+        )
+        vllm_group.add_argument(
             "--structured-outputs-config", **vllm_kwargs["structured_outputs_config"]
         )
         vllm_group.add_argument("--profiler-config", **vllm_kwargs["profiler_config"])
@@ -1363,10 +1385,15 @@ class EngineArgs:
         """Merge LDA config into additional_config when --dormant-model is set."""
         out = dict(self.additional_config)
         if self.dormant_model is not None:
-            out["lda"] = {
+            lda_cfg: dict[str, Any] = {
                 "dormant_model": self.dormant_model,
                 "lda_alpha": self.lda_alpha,
             }
+            if self.dormant_delta_dir is not None:
+                lda_cfg["dormant_delta_dir"] = self.dormant_delta_dir
+            if self.dormant_base_model is not None:
+                lda_cfg["dormant_base_model"] = self.dormant_base_model
+            out["lda"] = lda_cfg
         return out
 
     def create_engine_config(
@@ -1403,6 +1430,14 @@ class EngineArgs:
             raise ValueError(
                 "LDA (--dormant-model) and speculative decoding cannot be enabled "
                 "at the same time."
+            )
+        if self.dormant_delta_dir is not None and self.dormant_model is None:
+            raise ValueError(
+                "--dormant-delta-dir requires --dormant-model to enable LDA."
+            )
+        if self.dormant_base_model is not None and self.dormant_delta_dir is None:
+            raise ValueError(
+                "--dormant-base-model requires --dormant-delta-dir."
             )
 
         model_config = self.create_model_config()

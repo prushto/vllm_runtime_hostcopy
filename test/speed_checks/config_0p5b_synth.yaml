@@ -1,0 +1,28 @@
+base_model_id: "Qwen/Qwen2.5-0.5B-Instruct"
+dormant_model_id: "/workspace/dormant/weight_deltas/synthetic_models/qwen2_5_0_5b_synth_dormant"
+lda_alpha: 0.5
+dormant_delta_dir: "/workspace/dormant/weight_deltas/artifacts/qwen2_5_0_5b_instruct__synthetic_dormant__v1"
+dormant_base_model: "Qwen/Qwen2.5-0.5B-Instruct"
+gpu_memory_utilization: 0.4
+max_model_len: null
+
+gen_config:
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  repetition_penalty: 1.0
+  max_new_tokens: 32
+  do_sample: false
+
+benchmark:
+  n_prompts: 128
+  concurrencies: [1, 2, 4]
+  repeats: 1
+  warmup: true
+  seed: 42
+  continue_on_error: false
+  length_mix:
+    short: 0.5
+    medium: 0.4
+    long: 0.1
+
