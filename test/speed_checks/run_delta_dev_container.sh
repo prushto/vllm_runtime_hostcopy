@@ -24,18 +24,22 @@ CONTAINER_NAME="${CONTAINER_NAME:-vllm-delta-dev}"
 HOST_REPO="${HOST_REPO:-$HOME/vllm_runtime_hostcopy}"
 HOST_DORMANT="${HOST_DORMANT:-$HOME/dormant}"
 HF_CACHE_HOST="${HF_CACHE_HOST:-$HOME/.cache/huggingface}"
+HOST_CURSOR_DIR="${HOST_CURSOR_DIR:-$HOME/.cursor}"
 
 WORKSPACE="/workspace"
 HF_CACHE_CONTAINER="/hf-cache"
 SITE_PACKAGES_VLLM="/usr/local/lib/python3.12/dist-packages/vllm"
 TARGET_RUNNER_FILE="${SITE_PACKAGES_VLLM}/v1/worker/lda_gpu_model_runner.py"
 TARGET_ARGUTILS_FILE="${SITE_PACKAGES_VLLM}/engine/arg_utils.py"
+TARGET_GPU_WORKER_FILE="${SITE_PACKAGES_VLLM}/v1/worker/gpu_worker.py"
 
 EXPECTED_WORKSPACE_SOURCE="$(realpath "${HOST_REPO}")"
 EXPECTED_RUNNER_SOURCE="$(realpath "${HOST_REPO}/vllm/v1/worker/lda_gpu_model_runner.py")"
 EXPECTED_ARGUTILS_SOURCE="$(realpath "${HOST_REPO}/vllm/engine/arg_utils.py")"
+EXPECTED_GPU_WORKER_SOURCE="$(realpath "${HOST_REPO}/vllm/v1/worker/gpu_worker.py")"
 EXPECTED_DORMANT_SOURCE="$(realpath "${HOST_DORMANT}")"
 EXPECTED_HF_SOURCE="$(realpath "${HF_CACHE_HOST}")"
+EXPECTED_CURSOR_SOURCE="$(realpath "${HOST_CURSOR_DIR}")"
 
 require_docker() {
   if ! command -v docker >/dev/null 2>&1; then
@@ -65,8 +69,10 @@ verify_mounts() {
   local workspace_line="${EXPECTED_WORKSPACE_SOURCE} -> ${WORKSPACE}"
   local runner_line="${EXPECTED_RUNNER_SOURCE} -> ${TARGET_RUNNER_FILE}"
   local argutils_line="${EXPECTED_ARGUTILS_SOURCE} -> ${TARGET_ARGUTILS_FILE}"
+  local gpu_worker_line="${EXPECTED_GPU_WORKER_SOURCE} -> ${TARGET_GPU_WORKER_FILE}"
   local dormant_line="${EXPECTED_DORMANT_SOURCE} -> ${WORKSPACE}/dormant"
   local hf_line="${EXPECTED_HF_SOURCE} -> ${HF_CACHE_CONTAINER}"
+  local cursor_line="${EXPECTED_CURSOR_SOURCE} -> /home/prushto/.cursor"
 
   if ! grep -Fqx "${workspace_line}" <<<"${mounts}"; then
     echo "Mount check failed: expected ${workspace_line}" >&2
@@ -80,6 +86,10 @@ verify_mounts() {
     echo "Mount check failed: expected ${argutils_line}" >&2
     exit 1
   fi
+  if ! grep -Fqx "${gpu_worker_line}" <<<"${mounts}"; then
+    echo "Mount check failed: expected ${gpu_worker_line}" >&2
+    exit 1
+  fi
   if ! grep -Fqx "${dormant_line}" <<<"${mounts}"; then
     echo "Mount check failed: expected ${dormant_line}" >&2
     exit 1
@@ -88,11 +98,16 @@ verify_mounts() {
     echo "Mount check failed: expected ${hf_line}" >&2
     exit 1
   fi
+  if ! grep -Fqx "${cursor_line}" <<<"${mounts}"; then
+    echo "Mount check failed: expected ${cursor_line}" >&2
+    exit 1
+  fi
 }
 
 start_container() {
   mkdir -p "${HOST_DORMANT}"
   mkdir -p "${HF_CACHE_HOST}"
+  mkdir -p "${HOST_CURSOR_DIR}"
   if container_exists; then
     echo "Container ${CONTAINER_NAME} already exists."
     if container_running; then
@@ -113,9 +128,11 @@ start_container() {
     -e HF_DATASETS_CACHE="${HF_CACHE_CONTAINER}/datasets" \
     -v "${EXPECTED_RUNNER_SOURCE}:${TARGET_RUNNER_FILE}" \
     -v "${EXPECTED_ARGUTILS_SOURCE}:${TARGET_ARGUTILS_FILE}" \
+    -v "${EXPECTED_GPU_WORKER_SOURCE}:${TARGET_GPU_WORKER_FILE}" \
     -v "${EXPECTED_WORKSPACE_SOURCE}:${WORKSPACE}" \
     -v "${EXPECTED_DORMANT_SOURCE}:${WORKSPACE}/dormant" \
     -v "${EXPECTED_HF_SOURCE}:${HF_CACHE_CONTAINER}" \
+    -v "${EXPECTED_CURSOR_SOURCE}:/home/prushto/.cursor" \
     -w /tmp \
     "${IMAGE}" \
     bash -lc "sleep infinity" >/dev/null

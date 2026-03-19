@@ -4,6 +4,11 @@
 
 Blends logits from main and dormant models with a configurable alpha for
 synchronized token-by-token decoding. Uses two separate KV caches (no sharing).
+
+Delta-weights path (dormant_delta_dir): builds dormant from base + sparse delta
+to reduce memory by sharing unchanged params with the base model. EXPERIMENTAL:
+with param sharing enabled, forward outputs diverge from full-dormant LDA
+(parity failures). See in-file comment at "Share unchanged dormant params".
 """
 
 from __future__ import annotations
@@ -104,7 +109,6 @@ class LDAGPUModelRunner(GPUModelRunner):
                 self.dormant_delta_dir,
             )
             self._initialize_dormant_from_base_and_delta(dormant_model_config)
-            # Delta path sets parameters after model structure initialization.
             process_weights_after_loading(
                 self.dormant, dormant_model_config, self.device
             )
@@ -116,7 +120,8 @@ class LDAGPUModelRunner(GPUModelRunner):
                 model_config=dormant_model_config,
                 prefix=self.dormant_prefix,
             )
-        self.dormant.to(self.device)
+        if not self.dormant_delta_dir:
+            self.dormant.to(self.device)
         self.dormant.eval()
 
     def _dormant_model_config(self) -> ModelConfig:
@@ -135,6 +140,48 @@ class LDAGPUModelRunner(GPUModelRunner):
         if name.startswith(prefix):
             return name[len(prefix) :]
         return name
+
+    def _canonicalize_manifest_name(
+        self, name: str, runtime_param_names: set[str]
+    ) -> str:
+        packed_mapping = getattr(self.model, "packed_modules_mapping", None)
+        if isinstance(packed_mapping, dict):
+            for packed_name, split_names in packed_mapping.items():
+                if not isinstance(split_names, list):
+                    continue
+                for split_name in split_names:
+                    token = f".{split_name}."
+                    if token in name:
+                        candidate = name.replace(token, f".{packed_name}.")
+                        if candidate in runtime_param_names:
+                            return candidate
+        if name == "lm_head.weight" and "model.embed_tokens.weight" in runtime_param_names:
+            return "model.embed_tokens.weight"
+        if (
+            name == "model.embed_tokens.weight"
+            and "lm_head.weight" in runtime_param_names
+        ):
+            return "lm_head.weight"
+        return name
+
+    def _packed_split_name_for_name(
+        self, raw_name: str, canonical_name: str
+    ) -> str | None:
+        packed_mapping = getattr(self.model, "packed_modules_mapping", None)
+        if not isinstance(packed_mapping, dict):
+            return None
+        for packed_name, split_names in packed_mapping.items():
+            if not isinstance(split_names, list):
+                continue
+            for split_name in split_names:
+                token = f".{split_name}."
+                if token not in raw_name:
+                    continue
+                candidate = raw_name.replace(token, f".{packed_name}.")
+                if candidate != canonical_name:
+                    continue
+                return split_name
+        return None
 
     def _build_param_lookup(
         self, module: torch.nn.Module
@@ -246,6 +293,22 @@ class LDAGPUModelRunner(GPUModelRunner):
                 f"base_only={len(base_only)} dormant_only={len(dormant_only)}"
             )
 
+        changed_name_map = {
+            name: self._canonicalize_manifest_name(name, set(base_params))
+            for name in changed_name_set
+        }
+        changed_name_set = set(changed_name_map.values())
+        to_reference_set = {
+            self._canonicalize_manifest_name(name, set(base_params))
+            for name in to_reference_set
+        }
+        tied_names = {"lm_head.weight", "model.embed_tokens.weight"}
+        covered_tied = tied_names & (changed_name_set | to_reference_set)
+        if covered_tied:
+            for tied_name in tied_names:
+                if tied_name in base_params and tied_name in dormant_params:
+                    to_reference_set.add(tied_name)
+
         common_names = set(base_params) & set(dormant_params)
         covered = changed_name_set | to_reference_set
         missing = common_names - covered
@@ -258,37 +321,97 @@ class LDAGPUModelRunner(GPUModelRunner):
 
         # Apply changed tensors from delta artifact.
         changed_applied = 0
+        packed_accumulators: dict[str, torch.Tensor] = {}
         with safe_open(str(delta_path), framework="pt") as delta_file:
             delta_keys = set(delta_file.keys())
-            if delta_keys != changed_name_set:
-                only_delta = len(delta_keys - changed_name_set)
-                only_manifest = len(changed_name_set - delta_keys)
+            if delta_keys != set(changed_name_map):
+                only_delta = len(delta_keys - set(changed_name_map))
+                only_manifest = len(set(changed_name_map) - delta_keys)
                 raise ValueError(
                     "delta.safetensors keys mismatch changed_tensors in manifest: "
                     f"only_delta={only_delta} only_manifest={only_manifest}"
                 )
             for entry in changed_entries:
                 name = entry["name"]
-                target_parent, target_attr, target = dormant_bindings[name]
+                target_name = changed_name_map[name]
+                target_parent, target_attr, target = dormant_bindings[target_name]
                 src = delta_file.get_tensor(name)
-                if tuple(src.shape) != tuple(target.shape):
+                target_dtype = base_params[target_name].dtype
+                if str(src.dtype) != str(target_dtype):
                     raise ValueError(
-                        f"Shape mismatch for changed tensor {name}: "
-                        f"delta={tuple(src.shape)} target={tuple(target.shape)}"
+                        f"Dtype mismatch for changed tensor {name}->{target_name}: "
+                        f"delta={src.dtype} target={target_dtype}"
                     )
-                if str(src.dtype) != str(target.dtype):
-                    raise ValueError(
-                        f"Dtype mismatch for changed tensor {name}: "
-                        f"delta={src.dtype} target={target.dtype}"
+                split_name = self._packed_split_name_for_name(name, target_name)
+                src_t = src.to(device=self.device, dtype=target_dtype)
+                if split_name is None:
+                    if tuple(src_t.shape) != tuple(target.shape):
+                        raise ValueError(
+                            f"Shape mismatch for changed tensor {name}->{target_name}: "
+                            f"delta={tuple(src_t.shape)} target={tuple(target.shape)}"
+                        )
+                    new_param = torch.nn.Parameter(
+                        src_t, requires_grad=base_params[target_name].requires_grad
                     )
-                src_t = src.to(device=self.device, dtype=target.dtype)
-                new_param = torch.nn.Parameter(src_t, requires_grad=target.requires_grad)
+                else:
+                    base_template = base_params[target_name]
+                    merged_t = packed_accumulators.get(target_name)
+                    if merged_t is None:
+                        merged_t = base_template.detach().clone().to(
+                            device=self.device, dtype=base_template.dtype
+                        )
+                    if merged_t.dim() == 0 or src_t.dim() != merged_t.dim():
+                        raise ValueError(
+                            f"Unsupported packed delta rank for {name}->{target_name}: "
+                            f"delta_dim={src_t.dim()} target_dim={merged_t.dim()}"
+                        )
+                    axis = 0
+                    total = merged_t.shape[axis]
+                    part = src_t.shape[axis]
+                    if split_name in ("gate_proj", "q_proj"):
+                        start = 0
+                    elif split_name in ("up_proj", "v_proj"):
+                        start = total - part
+                    elif split_name == "k_proj":
+                        start = total - (2 * part)
+                    else:
+                        raise ValueError(
+                            f"Unsupported packed split name {split_name} for {name}"
+                        )
+                    end = start + part
+                    if start < 0 or end > total:
+                        raise ValueError(
+                            f"Invalid packed slice for {name}->{target_name}: "
+                            f"start={start} end={end} total={total}"
+                        )
+                    if merged_t.dim() == 1:
+                        merged_t[start:end] = src_t
+                    elif merged_t.dim() == 2:
+                        merged_t[start:end, :] = src_t
+                    else:
+                        raise ValueError(
+                            f"Unsupported packed tensor ndim={merged_t.dim()} for {name}"
+                        )
+                    packed_accumulators[target_name] = merged_t
+                    new_param = torch.nn.Parameter(
+                        merged_t, requires_grad=base_template.requires_grad
+                    )
                 setattr(target_parent, target_attr, new_param)
+                dormant_bindings[target_name] = (target_parent, target_attr, new_param)
+                dormant_params[target_name] = new_param
                 changed_applied += 1
 
-        # Alias unchanged dormant params to base params.
+        # Share unchanged dormant params with base (memory-saving: no duplicate
+        # storage for unchanged weights).
+        # KNOWN BUG (experimental branch): With this aliasing, LDA forward
+        # outputs diverge from full-dormant LDA (parity failures). Assembled
+        # weights match full dormant bit-for-bit; the failure appears at
+        # forward time, likely due to parameter/storage identity in vLLM or
+        # PyTorch. Cloning referenced params instead of aliasing restores
+        # parity but removes the memory benefit. Future work: fix sharing or
+        # use a different architecture for memory savings.
         referenced = 0
-        for name in to_reference:
+        for name in to_reference_set:
             target_parent, target_attr, dormant_p = dormant_bindings[name]
             base_p = base_params[name]
             if tuple(dormant_p.shape) != tuple(base_p.shape):
@@ -301,15 +424,34 @@ class LDAGPUModelRunner(GPUModelRunner):
                     f"Dtype mismatch for referenced tensor {name}: "
                     f"dormant={dormant_p.dtype} base={base_p.dtype}"
                 )
-            # Share the exact parameter object to avoid allocating duplicate
-            # unchanged weight storage in the dormant model.
             setattr(target_parent, target_attr, base_p)
             referenced += 1
 
+        # Alias dormant buffers to base buffers to avoid meta-buffer leftovers.
+        base_buffers = {
+            self._normalize_param_name(n): b
+            for n, b in self.model.named_buffers(remove_duplicate=False)
+        }
+        for raw_name, d_buf in self.dormant.named_buffers(remove_duplicate=False):
+            if d_buf.device.type != "meta":
+                continue
+            norm_name = self._normalize_param_name(raw_name)
+            if norm_name not in base_buffers:
+                continue
+            if "." in raw_name:
+                parent_name, attr = raw_name.rsplit(".", 1)
+                parent = self.dormant.get_submodule(parent_name)
+            else:
+                parent = self.dormant
+                attr = raw_name
+            setattr(parent, attr, base_buffers[norm_name])
+
         # Sanity check: after binding/applying, no dormant parameter should
         # remain on meta device.
+        remaining_meta = 0
         for name, param in self.dormant.named_parameters(remove_duplicate=False):
             if param.device.type == "meta":
+                remaining_meta += 1
                 raise ValueError(
                     "Dormant delta assembly left a meta parameter unmaterialized: "
                     f"{self._normalize_param_name(name)}"

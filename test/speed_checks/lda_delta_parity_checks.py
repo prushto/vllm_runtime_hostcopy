@@ -62,6 +62,8 @@ def build_llm_kwargs(
         "dormant_model": dormant_model,
         "lda_alpha": 0.5,
         "gpu_memory_utilization": gpu_memory_utilization,
+        # Keep parity checks deterministic and avoid cudagraph/compile drift.
+        "enforce_eager": True,
     }
     if max_model_len is not None:
         kwargs["max_model_len"] = int(max_model_len)
