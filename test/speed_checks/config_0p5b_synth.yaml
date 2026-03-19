@@ -1,5 +1,5 @@
 # Intended runtime: container launched by test/speed_checks/run_delta_dev_container.sh
-# where /workspace maps to /home/prushto/vllm_runtime_hostcopy_duplicate on host.
+# where /workspace maps to /home/prushto/vllm_runtime_hostcopy on host.
 base_model_id: "Qwen/Qwen2.5-0.5B-Instruct"
 dormant_model_id: "/workspace/dormant/weight_deltas/synthetic_models/qwen2_5_0_5b_synth_dormant"
 lda_alpha: 0.5

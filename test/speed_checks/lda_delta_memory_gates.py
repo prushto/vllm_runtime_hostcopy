@@ -35,7 +35,16 @@ def _query_gpu_used_mb(gpu_index: int) -> int:
     out = subprocess.check_output(cmd, text=True).strip().splitlines()
     if gpu_index < 0 or gpu_index >= len(out):
         raise ValueError(f"gpu-index {gpu_index} out of range for {len(out)} GPUs")
-    return int(out[gpu_index].strip())
+    raw = out[gpu_index].strip()
+    try:
+        return int(raw)
+    except ValueError:
+        # Some unified-memory platforms report [N/A] via nvidia-smi.
+        import torch
+
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device=gpu_index)
+        used_bytes = total_bytes - free_bytes
+        return int(used_bytes // (1024 * 1024))
 
 
 def _build_llm_kwargs(

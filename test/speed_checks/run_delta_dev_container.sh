@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Dedicated dev/test container for delta-weight work in the _duplicate repo.
+# Dedicated dev/test container for delta-weight work in this repo.
 # This script is intentionally strict: it verifies mounts to prevent accidental
 # writes/runs against non-duplicate paths.
 #
@@ -15,13 +15,13 @@ set -euo pipefail
 # Optional env overrides:
 #   IMAGE=nvcr.io/nvidia/vllm:26.02-py3
 #   CONTAINER_NAME=vllm-delta-dev
-#   HOST_REPO=/home/prushto/vllm_runtime_hostcopy_duplicate
+#   HOST_REPO=/home/prushto/vllm_runtime_hostcopy
 #   HOST_DORMANT=/home/prushto/dormant
 #   HF_CACHE_HOST=/home/prushto/.cache/huggingface
 
 IMAGE="${IMAGE:-nvcr.io/nvidia/vllm:26.02-py3}"
 CONTAINER_NAME="${CONTAINER_NAME:-vllm-delta-dev}"
-HOST_REPO="${HOST_REPO:-$HOME/vllm_runtime_hostcopy_duplicate}"
+HOST_REPO="${HOST_REPO:-$HOME/vllm_runtime_hostcopy}"
 HOST_DORMANT="${HOST_DORMANT:-$HOME/dormant}"
 HF_CACHE_HOST="${HF_CACHE_HOST:-$HOME/.cache/huggingface}"
 
@@ -116,7 +116,7 @@ start_container() {
     -v "${EXPECTED_WORKSPACE_SOURCE}:${WORKSPACE}" \
     -v "${EXPECTED_DORMANT_SOURCE}:${WORKSPACE}/dormant" \
     -v "${EXPECTED_HF_SOURCE}:${HF_CACHE_CONTAINER}" \
-    -w "${WORKSPACE}" \
+    -w /tmp \
     "${IMAGE}" \
     bash -lc "sleep infinity" >/dev/null
 
