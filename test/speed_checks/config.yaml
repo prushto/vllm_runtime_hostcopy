@@ -13,8 +13,10 @@ gen_config:
   do_sample: true
 
 benchmark:
+  # Default: vanilla + LDA. Add "lda_kl" to measure KL collection overhead (extra softmax work).
+  scenarios: ["vanilla", "lda"]
   n_prompts: 500
-  concurrencies: [1, 2, 4, 8, 16, 32]
+  concurrencies: [64, 128, 160]
   repeats: 1
   warmup: false
   seed: 42

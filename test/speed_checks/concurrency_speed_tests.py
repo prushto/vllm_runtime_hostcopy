@@ -12,9 +12,11 @@ human-readable and machine-readable reports under test_results/.
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import random
+import sys
 import statistics
 import time
 from dataclasses import dataclass
@@ -82,6 +84,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Only generate prompts CSV then exit.",
     )
+    parser.add_argument(
+        "--scenarios",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Override benchmark.scenarios (e.g. vanilla lda lda_kl).",
+    )
     return parser.parse_args()
 
 
@@ -91,6 +100,19 @@ def load_yaml(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"Expected dict-like yaml config, got: {type(data).__name__}")
     return data
+
+
+def _namespace_for_metadata(ns: argparse.Namespace) -> dict[str, Any]:
+    """JSON-serializable snapshot of argparse Namespace (Paths -> str)."""
+    out: dict[str, Any] = {}
+    for k, v in vars(ns).items():
+        if isinstance(v, Path):
+            out[k] = str(v)
+        elif isinstance(v, (list, tuple)):
+            out[k] = [str(x) if isinstance(x, Path) else x for x in v]
+        else:
+            out[k] = v
+    return out
 
 
 def _build_bucket_counts(total: int, ratios: dict[str, float]) -> dict[str, int]:
@@ -274,6 +296,19 @@ def _sampling_params_from_config(gen_config: dict[str, Any]):
     )
 
 
+def _additional_config_for_scenario(cfg: dict[str, Any], scenario: str) -> dict[str, Any] | None:
+    """Merge optional root `additional_config` with LDA flags per scenario."""
+    base = dict(cfg.get("additional_config") or {})
+    if scenario == "lda_kl":
+        lda = dict(base.get("lda") or {})
+        lda["collect_kl"] = True
+        base["lda"] = lda
+        return base
+    if scenario == "lda" and base:
+        return base
+    return None
+
+
 def _build_llm_kwargs(
     scenario: str,
     cfg: dict[str, Any],
@@ -290,9 +325,12 @@ def _build_llm_kwargs(
     )
     if max_model_len is not None:
         kwargs["max_model_len"] = int(max_model_len)
-    if scenario == "lda":
+    if scenario in ("lda", "lda_kl"):
         kwargs["dormant_model"] = cfg["dormant_model_id"]
         kwargs["lda_alpha"] = float(cfg.get("lda_alpha", 0.5))
+    ac = _additional_config_for_scenario(cfg, scenario)
+    if ac is not None:
+        kwargs["additional_config"] = ac
     return kwargs
 
 
@@ -586,7 +624,7 @@ def _write_txt(
     }
 
     with output_txt.open("w", encoding="utf-8") as f:
-        f.write("Concurrency Speed Tests (Vanilla vs LDA)\n")
+        f.write("Concurrency Speed Tests (Vanilla / LDA / optional LDA+collect_kl)\n")
         f.write("=" * 72 + "\n")
         f.write(f"generated_utc: {now}\n")
         f.write(f"config_path: {config_path}\n")
@@ -633,6 +671,24 @@ def _write_txt(
                 f"lda={lda['generation_time_s_mean']:.2f}s)\n"
             )
 
+        f.write("\nLDA + collect_kl overhead vs LDA (generation_time_s_mean)\n")
+        f.write("-" * 72 + "\n")
+        has_lda_kl = any(a["scenario"] == "lda_kl" for a in aggregate_rows)
+        if not has_lda_kl:
+            f.write("(no lda_kl scenario in this run — add \"lda_kl\" to benchmark.scenarios)\n")
+        else:
+            for c in concs:
+                lda = agg_map.get(("lda", c))
+                lda_kl = agg_map.get(("lda_kl", c))
+                if not lda or not lda_kl or lda["generation_time_s_mean"] <= 0:
+                    continue
+                ratio = lda_kl["generation_time_s_mean"] / lda["generation_time_s_mean"]
+                f.write(
+                    f"c={c:2d} lda_kl/lda={ratio:.3f}x "
+                    f"(lda={lda['generation_time_s_mean']:.2f}s, "
+                    f"lda_kl={lda_kl['generation_time_s_mean']:.2f}s)\n"
+                )
+
 
 def _write_run_metadata(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -660,6 +716,21 @@ def main() -> None:
         else bench_cfg.get("continue_on_error", True)
     )
     length_mix = bench_cfg.get("length_mix", {"short": 0.4, "medium": 0.4, "long": 0.2})
+
+    _ALLOWED_SCENARIOS = frozenset({"vanilla", "lda", "lda_kl"})
+    default_scenarios = ["vanilla", "lda"]
+    scenarios: list[str] = (
+        list(args.scenarios)
+        if args.scenarios
+        else list(bench_cfg.get("scenarios", default_scenarios))
+    )
+    if not scenarios:
+        raise ValueError("benchmark.scenarios must be a non-empty list")
+    for s in scenarios:
+        if s not in _ALLOWED_SCENARIOS:
+            raise ValueError(
+                f"Unknown scenario {s!r}; allowed: {sorted(_ALLOWED_SCENARIOS)}"
+            )
 
     if not args.prompts_csv.exists():
         generate_mixed_prompts_csv(
@@ -698,16 +769,21 @@ def main() -> None:
         "status": "running",
         "started_utc": datetime.now(timezone.utc).isoformat(),
         "config_path": str(args.config),
+        # Full YAML as loaded at run start (edits to the file later do not change this).
+        "config": copy.deepcopy(cfg),
+        "cli_args": _namespace_for_metadata(args),
+        "argv": sys.argv,
         "prompts_csv": str(args.prompts_csv),
         "n_prompts_requested": n_prompts,
         "n_prompts_loaded": len(prompts),
+        "limit_prompts": limit_prompts,
         "concurrencies": concurrencies,
         "repeats": repeats,
         "warmup": warmup,
         "seed": seed,
         "max_model_len_override": args.max_model_len,
         "continue_on_error": continue_on_error,
-        "scenarios": ["vanilla", "lda"],
+        "scenarios": scenarios,
     }
     _write_run_metadata(metadata_path, metadata_payload)
 
@@ -731,7 +807,7 @@ def main() -> None:
         _persist_checkpoint()
 
     try:
-        for scenario in ("vanilla", "lda"):
+        for scenario in scenarios:
             print(f"\n=== Running scenario: {scenario} ===")
             load_time_s, _rows = run_scenario(
                 scenario=scenario,

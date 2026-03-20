@@ -13,6 +13,7 @@ gen_config:
   do_sample: true
 
 benchmark:
+  scenarios: ["vanilla", "lda"]
   n_prompts: 500
   concurrencies: [1, 2, 4, 8, 16, 32]
   repeats: 1
