@@ -8,6 +8,7 @@ synchronized token-by-token decoding. Uses two separate KV caches (no sharing).
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -19,6 +20,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.lda_kl_utils import kl_divergence_dormant_base, lda_blend_logits
 from vllm.v1.worker.utils import bind_kv_cache
 
 if TYPE_CHECKING:
@@ -82,6 +84,30 @@ class LDAGPUModelRunner(GPUModelRunner):
         # do not collide with the main model's in static_forward_context.
         self.dormant_prefix = "dormant"
 
+        # Optional: KL(dormant||base) stats for benchmarks (two extra softmax passes).
+        self._lda_collect_kl: bool = bool(lda.get("collect_kl", False))
+        self._lda_last_kl_max: float | None = None
+        self._lda_last_kl_mean: float | None = None
+
+        # Optional: assert identical logits / near-zero KL when main and dormant
+        # checkpoints are the same (see test_lda_same_model_validate.py).
+        env_strict = os.environ.get("VLLM_LDA_VALIDATE_SAME_CHECKPOINT", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        self._lda_validate_same: bool = bool(lda.get("validate_same_checkpoint", False)) or env_strict
+        self._lda_validation_rtol: float = float(lda.get("validation_logits_rtol", 0.02))
+        self._lda_validation_atol: float = float(lda.get("validation_logits_atol", 0.2))
+        self._lda_validation_kl_max: float = float(lda.get("validation_kl_max", 1e-3))
+        if self._lda_validate_same and not self._lda_same_checkpoint_paths():
+            logger.warning(
+                "LDA validate_same_checkpoint is set but dormant_model (%s) != "
+                "main model (%s); skipping logits/KL checks.",
+                self.dormant_model,
+                self.model_config.model,
+            )
+
     def load_model(self, eep_scale_up: bool = False) -> None:
         super().load_model(eep_scale_up=eep_scale_up)
         if self.dormant is not None:
@@ -100,6 +126,11 @@ class LDAGPUModelRunner(GPUModelRunner):
     def _dormant_model_config(self) -> ModelConfig:
         """ModelConfig for the dormant model (same arch as main, different path)."""
         return replace(self.model_config, model=self.dormant_model)
+
+    def _lda_same_checkpoint_paths(self) -> bool:
+        """True if dormant and main resolve to the same model id/path string."""
+        main = self.model_config.model
+        return os.path.normpath(str(main)) == os.path.normpath(str(self.dormant_model))
 
     def _get_dormant_attn_layers(self) -> dict[str, Attention]:
         if self._dormant_attn_layers is not None:
@@ -217,5 +248,32 @@ class LDAGPUModelRunner(GPUModelRunner):
         dormant_hidden = dormant_output[logits_indices]
         dormant_logits = self.dormant.compute_logits(dormant_hidden)
         alpha = self.lda_alpha
-        amplified = dormant_logits + alpha * (dormant_logits - logits)
+        need_kl = self._lda_collect_kl or (
+            self._lda_validate_same and self._lda_same_checkpoint_paths()
+        )
+        if need_kl:
+            kl_row = kl_divergence_dormant_base(dormant_logits, logits)
+            if self._lda_collect_kl:
+                self._lda_last_kl_max = float(kl_row.max().item())
+                self._lda_last_kl_mean = float(kl_row.mean().item())
+            if self._lda_validate_same and self._lda_same_checkpoint_paths():
+                if not torch.allclose(
+                    dormant_logits,
+                    logits,
+                    rtol=self._lda_validation_rtol,
+                    atol=self._lda_validation_atol,
+                ):
+                    diff = (dormant_logits - logits).abs()
+                    raise RuntimeError(
+                        "LDA same-checkpoint validation failed: dormant logits differ "
+                        f"from base (max abs diff={diff.max().item():.6g})."
+                    )
+                kl_max = float(kl_row.max().item())
+                if kl_max > self._lda_validation_kl_max:
+                    raise RuntimeError(
+                        "LDA same-checkpoint validation failed: KL(dormant||base) "
+                        f"max={kl_max:.6g} exceeds threshold "
+                        f"{self._lda_validation_kl_max:g}."
+                    )
+        amplified = lda_blend_logits(dormant_logits, logits, alpha)
         return amplified.to(logits.dtype).to(logits.device)

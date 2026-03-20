@@ -1363,10 +1363,11 @@ class EngineArgs:
         """Merge LDA config into additional_config when --dormant-model is set."""
         out = dict(self.additional_config)
         if self.dormant_model is not None:
-            out["lda"] = {
-                "dormant_model": self.dormant_model,
-                "lda_alpha": self.lda_alpha,
-            }
+            # Preserve user-provided lda keys (e.g. validate_same_checkpoint).
+            lda_merged: dict[str, Any] = dict(out.get("lda") or {})
+            lda_merged["dormant_model"] = self.dormant_model
+            lda_merged["lda_alpha"] = self.lda_alpha
+            out["lda"] = lda_merged
         return out
 
     def create_engine_config(
