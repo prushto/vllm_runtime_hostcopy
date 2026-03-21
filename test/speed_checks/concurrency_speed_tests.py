@@ -7,6 +7,10 @@ This script benchmarks two scenarios on the same prompt set:
 
 It measures model load time separately from generation time, and writes both
 human-readable and machine-readable reports under test_results/.
+
+**LDA α sweep:** set ``benchmark.lda_alphas: [0.5, 1.0, 3.0]`` (or root ``lda_alphas``).
+Each value runs ``lda`` / ``lda_kl`` with a fresh ``LLM`` (``lda_alpha`` is fixed at init).
+``vanilla`` runs once. CSV/txt include an ``lda_alpha`` column / suffix where applicable.
 """
 
 from __future__ import annotations
@@ -95,6 +99,8 @@ class RepeatResult:
     end_to_end_time_s: float
     status: str = "ok"
     error: str = ""
+    # Set for lda / lda_kl; None for vanilla (and legacy runs without the field).
+    lda_alpha: float | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -453,6 +459,34 @@ def _run_one_dataset_pass(
     return elapsed, total_output_tokens, total_input_tokens
 
 
+def _log_scenario_tag(scenario: str, cfg: dict[str, Any]) -> str:
+    if scenario in ("lda", "lda_kl"):
+        return f"{scenario} α={float(cfg.get('lda_alpha', 0.5))}"
+    return scenario
+
+
+def _repeat_lda_alpha(scenario: str, cfg: dict[str, Any]) -> float | None:
+    if scenario not in ("lda", "lda_kl"):
+        return None
+    return float(cfg.get("lda_alpha", 0.5))
+
+
+def _resolve_lda_alphas(bench_cfg: dict[str, Any], cfg: dict[str, Any]) -> list[float]:
+    """Single alpha from root ``lda_alpha`` unless ``lda_alphas`` is set (benchmark or root)."""
+    raw = bench_cfg.get("lda_alphas")
+    if raw is None:
+        raw = cfg.get("lda_alphas")
+    if raw is not None and isinstance(raw, (list, tuple)) and len(raw) > 0:
+        return [float(x) for x in raw]
+    return [float(cfg.get("lda_alpha", 0.5))]
+
+
+def _load_time_meta_key(scenario: str, cfg: dict[str, Any]) -> str:
+    if scenario in ("lda", "lda_kl"):
+        return f"{scenario}@a{float(cfg.get('lda_alpha', 0.5))}"
+    return scenario
+
+
 def run_scenario(
     scenario: str,
     cfg: dict[str, Any],
@@ -467,12 +501,16 @@ def run_scenario(
 ) -> tuple[float, list[RepeatResult]]:
     from vllm import LLM
 
+    tag = _log_scenario_tag(scenario, cfg)
+    ra = _repeat_lda_alpha(scenario, cfg)
+
     llm_kwargs = _build_llm_kwargs(scenario, cfg, max_model_len_override)
-    print(f"[{scenario}] Loading model(s)...")
+    print(f"[{tag}] Loading model(s)...")
     t_load = time.perf_counter()
+    llm: Any = None
     llm = LLM(**llm_kwargs)
     load_time_s = time.perf_counter() - t_load
-    print(f"[{scenario}] load_time_s={load_time_s:.2f}")
+    print(f"[{tag}] load_time_s={load_time_s:.2f}")
 
     sampling_params = _sampling_params_from_config(cfg["gen_config"])
     messages = _messages_from_prompts(prompts)
@@ -480,7 +518,7 @@ def run_scenario(
 
     try:
         for concurrency in concurrencies:
-            print(f"[{scenario}] concurrency={concurrency} start")
+            print(f"[{tag}] concurrency={concurrency} start")
             warmup_time_s: float | None = None
             if warmup:
                 warm_batch = messages[: max(1, min(concurrency, len(messages)))]
@@ -488,7 +526,7 @@ def run_scenario(
                 try:
                     llm.chat(warm_batch, sampling_params=sampling_params, use_tqdm=False)
                     warmup_time_s = time.perf_counter() - t_warmup0
-                    print(f"[{scenario}] concurrency={concurrency} warmup_s={warmup_time_s:.2f}")
+                    print(f"[{tag}] concurrency={concurrency} warmup_s={warmup_time_s:.2f}")
                 except Exception as e:  # noqa: BLE001
                     rr = RepeatResult(
                         scenario=scenario,
@@ -506,18 +544,19 @@ def run_scenario(
                         end_to_end_time_s=load_time_s,
                         status="error",
                         error=f"warmup_failed: {e}",
+                        lda_alpha=ra,
                     )
                     all_results.append(rr)
                     if on_repeat_result is not None:
                         on_repeat_result(rr)
-                    print(f"[{scenario}] concurrency={concurrency} warmup ERROR: {e}")
+                    print(f"[{tag}] concurrency={concurrency} warmup ERROR: {e}")
                     if not continue_on_error:
                         raise
                     # Continue to next concurrency to keep partial data.
                     continue
 
             for repeat_idx in range(1, repeats + 1):
-                print(f"[{scenario}] concurrency={concurrency} repeat={repeat_idx}/{repeats} start")
+                print(f"[{tag}] concurrency={concurrency} repeat={repeat_idx}/{repeats} start")
                 try:
                     gen_time_s, out_tokens, in_tokens = _run_one_dataset_pass(
                         llm=llm,
@@ -548,13 +587,14 @@ def run_scenario(
                             output_tokens_per_s=out_tokens_per_s,
                             ms_per_output_token=ms_per_out_token,
                             end_to_end_time_s=load_time_s + gen_time_s,
+                            lda_alpha=ra,
                         )
                     )
                     rr = all_results[-1]
                     if on_repeat_result is not None:
                         on_repeat_result(rr)
                     print(
-                        f"[{scenario}] concurrency={concurrency} repeat={repeat_idx}/{repeats} "
+                        f"[{tag}] concurrency={concurrency} repeat={repeat_idx}/{repeats} "
                         f"done gen_s={gen_time_s:.2f} out_toks={out_tokens} out_tps={out_tokens_per_s:.2f}"
                     )
                 except Exception as e:  # noqa: BLE001
@@ -574,32 +614,41 @@ def run_scenario(
                         end_to_end_time_s=load_time_s,
                         status="error",
                         error=str(e),
+                        lda_alpha=ra,
                     )
                     all_results.append(rr)
                     if on_repeat_result is not None:
                         on_repeat_result(rr)
                     print(
-                        f"[{scenario}] concurrency={concurrency} repeat={repeat_idx}/{repeats} "
+                        f"[{tag}] concurrency={concurrency} repeat={repeat_idx}/{repeats} "
                         f"ERROR: {e}"
                     )
                     if not continue_on_error:
                         raise
     finally:
-        # Explicitly drop model at end of scenario before next one.
-        del llm
+        if llm is not None:
+            del llm
 
     return load_time_s, all_results
 
 
 def _aggregate(results: list[RepeatResult]) -> list[dict[str, Any]]:
-    grouped: dict[tuple[str, int], list[RepeatResult]] = {}
+    grouped: dict[tuple[str, int, float | None], list[RepeatResult]] = {}
     for r in results:
         if r.status != "ok":
             continue
-        grouped.setdefault((r.scenario, r.concurrency), []).append(r)
+        grouped.setdefault((r.scenario, r.concurrency, r.lda_alpha), []).append(r)
 
     rows: list[dict[str, Any]] = []
-    for (scenario, concurrency), g in sorted(grouped.items(), key=lambda x: (x[0][0], x[0][1])):
+
+    def _sort_key(t: tuple[str, int, float | None]) -> tuple[str, int, float]:
+        scenario, concurrency, alpha = t
+        a = float(alpha) if alpha is not None else float("-inf")
+        return (scenario, concurrency, a)
+
+    for (scenario, concurrency, lda_alpha), g in sorted(
+        grouped.items(), key=lambda x: _sort_key(x[0])
+    ):
         def avg(vals: list[float]) -> float:
             return statistics.mean(vals) if vals else 0.0
 
@@ -614,6 +663,7 @@ def _aggregate(results: list[RepeatResult]) -> list[dict[str, Any]]:
             {
                 "scenario": scenario,
                 "concurrency": concurrency,
+                "lda_alpha": lda_alpha,
                 "repeats_ok": len(g),
                 "generation_time_s_mean": avg(gen_times),
                 "generation_time_s_std": std(gen_times),
@@ -637,6 +687,7 @@ def _write_csv(
             [
                 "row_type",
                 "scenario",
+                "lda_alpha",
                 "concurrency",
                 "repeat_index",
                 "status",
@@ -658,6 +709,7 @@ def _write_csv(
                 [
                     "repeat",
                     r.scenario,
+                    "" if r.lda_alpha is None else f"{r.lda_alpha}",
                     r.concurrency,
                     r.repeat_index,
                     r.status,
@@ -680,6 +732,7 @@ def _write_csv(
             [
                 "row_type",
                 "scenario",
+                "lda_alpha",
                 "concurrency",
                 "repeats_ok",
                 "generation_time_s_mean",
@@ -690,10 +743,12 @@ def _write_csv(
             ]
         )
         for a in aggregate_rows:
+            la = a.get("lda_alpha")
             writer.writerow(
                 [
                     "aggregate",
                     a["scenario"],
+                    "" if la is None else f"{la}",
                     a["concurrency"],
                     a["repeats_ok"],
                     f"{a['generation_time_s_mean']:.6f}",
@@ -716,9 +771,9 @@ def _write_txt(
     output_txt.parent.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc).isoformat()
 
-    # Build quick lookup for LDA-vs-vanilla ratio by concurrency.
-    agg_map: dict[tuple[str, int], dict[str, Any]] = {
-        (a["scenario"], a["concurrency"]): a for a in aggregate_rows
+    # Build quick lookup for LDA-vs-vanilla ratio by concurrency (+ alpha for lda).
+    agg_map: dict[tuple[str, int, float | None], dict[str, Any]] = {
+        (a["scenario"], a["concurrency"], a.get("lda_alpha")): a for a in aggregate_rows
     }
 
     with output_txt.open("w", encoding="utf-8") as f:
@@ -732,8 +787,11 @@ def _write_txt(
         f.write("Per-repeat rows\n")
         f.write("-" * 72 + "\n")
         for r in repeat_results:
+            alpha_s = (
+                f" α={r.lda_alpha}" if r.lda_alpha is not None else ""
+            )
             f.write(
-                f"{r.scenario:8s} c={r.concurrency:2d} rep={r.repeat_index} "
+                f"{r.scenario:8s}{alpha_s} c={r.concurrency:2d} rep={r.repeat_index} "
                 f"status={r.status:5s} load={r.load_time_s:8.2f}s "
                 f"gen={r.generation_time_s:8.2f}s out_tok={r.total_output_tokens:7d} "
                 f"out_tps={r.output_tokens_per_s:9.2f} pps={r.prompts_per_s:8.2f}"
@@ -745,8 +803,10 @@ def _write_txt(
         f.write("\nAggregate means\n")
         f.write("-" * 72 + "\n")
         for a in aggregate_rows:
+            la = a.get("lda_alpha")
+            alpha_s = f" α={la}" if la is not None else ""
             f.write(
-                f"{a['scenario']:8s} c={a['concurrency']:2d} "
+                f"{a['scenario']:8s}{alpha_s} c={a['concurrency']:2d} "
                 f"repeats_ok={a['repeats_ok']:2d} "
                 f"gen_mean={a['generation_time_s_mean']:8.2f}s "
                 f"gen_std={a['generation_time_s_std']:7.2f}s "
@@ -758,16 +818,19 @@ def _write_txt(
         f.write("-" * 72 + "\n")
         concs = sorted({x.concurrency for x in repeat_results})
         for c in concs:
-            base = agg_map.get(("vanilla", c))
-            lda = agg_map.get(("lda", c))
-            if not base or not lda or base["generation_time_s_mean"] <= 0:
+            base = agg_map.get(("vanilla", c, None))
+            if not base or base["generation_time_s_mean"] <= 0:
                 continue
-            ratio = lda["generation_time_s_mean"] / base["generation_time_s_mean"]
-            f.write(
-                f"c={c:2d} lda/base={ratio:.3f}x "
-                f"(vanilla={base['generation_time_s_mean']:.2f}s, "
-                f"lda={lda['generation_time_s_mean']:.2f}s)\n"
-            )
+            for a in aggregate_rows:
+                if a["scenario"] != "lda" or a["concurrency"] != c:
+                    continue
+                la = a.get("lda_alpha")
+                ratio = a["generation_time_s_mean"] / base["generation_time_s_mean"]
+                f.write(
+                    f"c={c:2d} α={la} lda/base={ratio:.3f}x "
+                    f"(vanilla={base['generation_time_s_mean']:.2f}s, "
+                    f"lda={a['generation_time_s_mean']:.2f}s)\n"
+                )
 
         f.write("\nLDA + collect_kl overhead vs LDA (generation_time_s_mean)\n")
         f.write("-" * 72 + "\n")
@@ -776,16 +839,23 @@ def _write_txt(
             f.write("(no lda_kl scenario in this run — add \"lda_kl\" to benchmark.scenarios)\n")
         else:
             for c in concs:
-                lda = agg_map.get(("lda", c))
-                lda_kl = agg_map.get(("lda_kl", c))
-                if not lda or not lda_kl or lda["generation_time_s_mean"] <= 0:
-                    continue
-                ratio = lda_kl["generation_time_s_mean"] / lda["generation_time_s_mean"]
-                f.write(
-                    f"c={c:2d} lda_kl/lda={ratio:.3f}x "
-                    f"(lda={lda['generation_time_s_mean']:.2f}s, "
-                    f"lda_kl={lda_kl['generation_time_s_mean']:.2f}s)\n"
-                )
+                for a_kl in aggregate_rows:
+                    if a_kl["scenario"] != "lda_kl" or a_kl["concurrency"] != c:
+                        continue
+                    alpha = a_kl.get("lda_alpha")
+                    lda = agg_map.get(("lda", c, alpha))
+                    if (
+                        not lda
+                        or lda["generation_time_s_mean"] <= 0
+                        or a_kl["generation_time_s_mean"] <= 0
+                    ):
+                        continue
+                    ratio = a_kl["generation_time_s_mean"] / lda["generation_time_s_mean"]
+                    f.write(
+                        f"c={c:2d} α={alpha} lda_kl/lda={ratio:.3f}x "
+                        f"(lda={lda['generation_time_s_mean']:.2f}s, "
+                        f"lda_kl={a_kl['generation_time_s_mean']:.2f}s)\n"
+                    )
         f.flush()
 
 
@@ -883,6 +953,7 @@ def main() -> None:
 
     all_repeat_results: list[RepeatResult] = []
     load_times: dict[str, float] = {}
+    lda_alphas = _resolve_lda_alphas(bench_cfg, cfg)
     metadata_payload: dict[str, Any] = {
         "run_id": run_id,
         "status": "running",
@@ -905,6 +976,7 @@ def main() -> None:
         "scenarios": scenarios,
         "run_label": args.run_label,
         "progress_log_every_batches": progress_log_every_batch,
+        "lda_alphas": lda_alphas,
     }
     _write_run_metadata(metadata_path, metadata_payload)
     _invoke_after_checkpoint_hook()
@@ -935,24 +1007,41 @@ def main() -> None:
 
     try:
         for scenario in scenarios:
-            print(f"\n=== Running scenario: {scenario} ===")
-            load_time_s, _rows = run_scenario(
-                scenario=scenario,
-                cfg=cfg,
-                prompts=prompts,
-                concurrencies=concurrencies,
-                repeats=repeats,
-                warmup=warmup,
-                max_model_len_override=args.max_model_len,
-                continue_on_error=continue_on_error,
-                on_repeat_result=_on_repeat_result,
-                progress_log_every_batch=progress_log_every_batch,
-            )
-            load_times[scenario] = load_time_s
-            metadata_payload["load_times"] = load_times
-            _write_run_metadata(metadata_path, metadata_payload)
-            _invoke_after_checkpoint_hook()
-            print(f"{scenario} load_time_s={load_time_s:.2f}")
+            if scenario == "vanilla":
+                cfgs_to_run = [cfg]
+            else:
+                cfgs_to_run = []
+                for alpha in lda_alphas:
+                    cfg_i = copy.deepcopy(cfg)
+                    cfg_i["lda_alpha"] = alpha
+                    cfgs_to_run.append(cfg_i)
+
+            for cfg_run in cfgs_to_run:
+                if scenario == "vanilla":
+                    print(f"\n=== Running scenario: {scenario} ===")
+                else:
+                    print(
+                        f"\n=== Running scenario: {scenario} "
+                        f"(lda_alpha={float(cfg_run.get('lda_alpha', 0.5))}) ==="
+                    )
+                load_time_s, _rows = run_scenario(
+                    scenario=scenario,
+                    cfg=cfg_run,
+                    prompts=prompts,
+                    concurrencies=concurrencies,
+                    repeats=repeats,
+                    warmup=warmup,
+                    max_model_len_override=args.max_model_len,
+                    continue_on_error=continue_on_error,
+                    on_repeat_result=_on_repeat_result,
+                    progress_log_every_batch=progress_log_every_batch,
+                )
+                lk = _load_time_meta_key(scenario, cfg_run)
+                load_times[lk] = load_time_s
+                metadata_payload["load_times"] = load_times
+                _write_run_metadata(metadata_path, metadata_payload)
+                _invoke_after_checkpoint_hook()
+                print(f"{lk} load_time_s={load_time_s:.2f}")
 
         metadata_payload["status"] = "completed"
         metadata_payload["finished_utc"] = datetime.now(timezone.utc).isoformat()
