@@ -1,0 +1,48 @@
+# Modal: dummy DeepSeek LDA + lmsys CSV (e.g. prompts_lmsys_n1000_s42.csv).
+# Concurrency ladder 256 → 320 → 512. Matches the successful run logged as
+# ``260321-1539-lda-ladder-lmsys-1-1`` (``enforce_eager: true`` = no torch.compile path).
+#
+# For the 5k normalized pack + single concurrency 512 + compile-friendly settings,
+# use ``dormant/modal/config/lda_dummy_experiment_lmsys.yaml`` (worker:
+# ``/root/modal_pkg/config/lda_dummy_experiment_lmsys.yaml``) and
+# ``/root/modal_data/.../prompts_n5000_s42.csv``.
+
+base_model_id: "deepseek-ai/DeepSeek-V3"
+dormant_model_id: "deepseek-ai/DeepSeek-V3"
+lda_alpha: 0.5
+gpu_memory_utilization: 0.85
+max_model_len: 256
+
+load_format: "dummy"
+tensor_parallel_size: 8
+max_num_batched_tokens: 256
+trust_remote_code: true
+enforce_eager: true
+enable_expert_parallel: false
+
+additional_config:
+  lda:
+    collect_kl: true
+    kv_cache_max_memory_gib: 8
+
+gen_config:
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
+  repetition_penalty: 1.05
+  max_new_tokens: 128
+  do_sample: true
+
+benchmark:
+  scenarios: ["lda"]
+  n_prompts: 1000
+  concurrencies: [256, 320, 512]
+  repeats: 1
+  warmup: false
+  seed: 42
+  continue_on_error: true
+  progress_log_every_batches: 1
+  length_mix:
+    short: 0.4
+    medium: 0.4
+    long: 0.2

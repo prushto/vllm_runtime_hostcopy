@@ -16,15 +16,53 @@ import copy
 import csv
 import json
 import random
+import re
 import sys
 import statistics
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
+
+# Optional hook (e.g. Modal `volume.commit()`) after each txt/csv/metadata checkpoint.
+_after_checkpoint_hook: Callable[[], None] | None = None
+
+
+def set_after_checkpoint_hook(fn: Callable[[], None] | None) -> None:
+    """Register a callback invoked after incremental results are flushed to disk."""
+    global _after_checkpoint_hook
+    _after_checkpoint_hook = fn
+
+
+def _sanitize_run_label(label: str) -> str:
+    s = label.lower().strip()
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    s = s.strip("-")
+    return s or "run"
+
+
+def make_human_run_id(purpose: str, output_parent: Path, now: datetime | None = None) -> str:
+    """Human-readable folder name: ``yymmdd-HHMM-<slug>-<seq>`` (UTC), seq disambiguates collisions."""
+    now = now or datetime.now(timezone.utc)
+    slug = _sanitize_run_label(purpose)
+    prefix = f"{now.strftime('%y%m%d-%H%M')}-{slug}-"
+    output_parent = Path(output_parent)
+    output_parent.mkdir(parents=True, exist_ok=True)
+    max_n = 0
+    if output_parent.is_dir():
+        for child in output_parent.iterdir():
+            if not child.is_dir():
+                continue
+            name = child.name
+            if not name.startswith(prefix):
+                continue
+            suffix = name[len(prefix) :]
+            if suffix.isdigit():
+                max_n = max(max_n, int(suffix))
+    return f"{prefix}{max_n + 1}"
 
 
 ROOT = Path(__file__).resolve().parent
@@ -70,7 +108,17 @@ def parse_args() -> argparse.Namespace:
         "--run-id",
         type=str,
         default=None,
-        help="Optional run id. If not set, a UTC timestamp is used.",
+        help="Explicit run folder name. Overrides --run-label.",
+    )
+    parser.add_argument(
+        "--run-label",
+        type=str,
+        default=None,
+        metavar="PURPOSE",
+        help=(
+            "Human-readable run id (UTC yymmdd-HHMM-<purpose>-<n> under --output-dir). "
+            "Ignored if --run-id is set."
+        ),
     )
     parser.add_argument("--concurrencies", type=int, nargs="*", default=None)
     parser.add_argument("--repeats", type=int, default=None)
@@ -90,6 +138,14 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=None,
         help="Override benchmark.scenarios (e.g. vanilla lda lda_kl).",
+    )
+    parser.add_argument(
+        "--progress-log-every-batches",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Log every N completed llm.chat batches during a repeat (1=every batch). "
+        "0 disables. Default: benchmark.progress_log_every_batches or 1.",
     )
     return parser.parse_args()
 
@@ -355,12 +411,23 @@ def _run_one_dataset_pass(
     messages: list[list[dict[str, str]]],
     concurrency: int,
     sampling_params: Any,
+    *,
+    scenario: str,
+    repeat_index: int,
+    progress_log_every_batch: int = 1,
 ) -> tuple[float, int, int]:
+    """Run all prompts in chunks of ``concurrency``. Optionally log rolling out_tok/s after each batch.
+
+    Timers here cover **this repeat’s** ``llm.chat`` calls only (not model load).
+    """
     t0 = time.perf_counter()
     total_output_tokens = 0
     total_input_tokens = 0
-    for i in range(0, len(messages), concurrency):
+    n_msg = len(messages)
+    batch_num = 0
+    for i in range(0, n_msg, concurrency):
         batch = messages[i : i + concurrency]
+        batch_num += 1
         outputs = llm.chat(batch, sampling_params=sampling_params, use_tqdm=False)
         for out in outputs:
             if out.outputs:
@@ -368,6 +435,20 @@ def _run_one_dataset_pass(
             prompt_token_ids = getattr(out, "prompt_token_ids", None)
             if prompt_token_ids is not None:
                 total_input_tokens += len(prompt_token_ids)
+        n_done = min(i + len(batch), n_msg)
+        elapsed = time.perf_counter() - t0
+        rate = total_output_tokens / elapsed if elapsed > 0 else 0.0
+        is_last = n_done >= n_msg
+        if progress_log_every_batch > 0 and (
+            batch_num % progress_log_every_batch == 0 or is_last
+        ):
+            print(
+                f"[{scenario}] c={concurrency} rep={repeat_index} batch={batch_num} "
+                f"prompts={n_done}/{n_msg} out_tok={total_output_tokens} "
+                f"gen_s={elapsed:.1f} out_tok/s={rate:.2f} "
+                f"(this repeat only; excludes load)",
+                flush=True,
+            )
     elapsed = time.perf_counter() - t0
     return elapsed, total_output_tokens, total_input_tokens
 
@@ -382,6 +463,7 @@ def run_scenario(
     max_model_len_override: int | None,
     continue_on_error: bool,
     on_repeat_result: Any = None,
+    progress_log_every_batch: int = 1,
 ) -> tuple[float, list[RepeatResult]]:
     from vllm import LLM
 
@@ -442,6 +524,9 @@ def run_scenario(
                         messages=messages,
                         concurrency=concurrency,
                         sampling_params=sampling_params,
+                        scenario=scenario,
+                        repeat_index=repeat_idx,
+                        progress_log_every_batch=progress_log_every_batch,
                     )
                     prompts_per_s = len(messages) / gen_time_s if gen_time_s > 0 else 0.0
                     out_tokens_per_s = out_tokens / gen_time_s if gen_time_s > 0 else 0.0
@@ -618,6 +703,7 @@ def _write_csv(
                     f"{a['ms_per_output_token_mean']:.6f}",
                 ]
             )
+        f.flush()
 
 
 def _write_txt(
@@ -700,12 +786,23 @@ def _write_txt(
                     f"(lda={lda['generation_time_s_mean']:.2f}s, "
                     f"lda_kl={lda_kl['generation_time_s_mean']:.2f}s)\n"
                 )
+        f.flush()
 
 
 def _write_run_metadata(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
+        f.flush()
+
+
+def _invoke_after_checkpoint_hook() -> None:
+    if _after_checkpoint_hook is None:
+        return
+    try:
+        _after_checkpoint_hook()
+    except Exception as e:  # noqa: BLE001
+        print(f"[speed_checks] after-checkpoint hook failed: {e}", file=sys.stderr, flush=True)
 
 
 def main() -> None:
@@ -728,6 +825,11 @@ def main() -> None:
         else bench_cfg.get("continue_on_error", True)
     )
     length_mix = bench_cfg.get("length_mix", {"short": 0.4, "medium": 0.4, "long": 0.2})
+    progress_log_every_batch = int(
+        args.progress_log_every_batches
+        if args.progress_log_every_batches is not None
+        else bench_cfg.get("progress_log_every_batches", 1)
+    )
 
     _ALLOWED_SCENARIOS = frozenset({"vanilla", "lda", "lda_kl"})
     default_scenarios = ["vanilla", "lda"]
@@ -767,7 +869,12 @@ def main() -> None:
             "This can happen when --limit-prompts is used or CSV has fewer rows."
         )
 
-    run_id = args.run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    if args.run_id:
+        run_id = args.run_id
+    elif args.run_label:
+        run_id = make_human_run_id(args.run_label, args.output_dir)
+    else:
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir = args.output_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     txt_path = run_dir / "concurrency_speed_tests.txt"
@@ -796,8 +903,11 @@ def main() -> None:
         "max_model_len_override": args.max_model_len,
         "continue_on_error": continue_on_error,
         "scenarios": scenarios,
+        "run_label": args.run_label,
+        "progress_log_every_batches": progress_log_every_batch,
     }
     _write_run_metadata(metadata_path, metadata_payload)
+    _invoke_after_checkpoint_hook()
 
     def _persist_checkpoint() -> None:
         aggregate_rows_local = _aggregate(all_repeat_results)
@@ -813,6 +923,11 @@ def main() -> None:
             repeat_results=all_repeat_results,
             aggregate_rows=aggregate_rows_local,
         )
+        metadata_payload["last_checkpoint_utc"] = datetime.now(timezone.utc).isoformat()
+        metadata_payload["n_repeat_rows"] = len(all_repeat_results)
+        metadata_payload["status"] = "running"
+        _write_run_metadata(metadata_path, metadata_payload)
+        _invoke_after_checkpoint_hook()
 
     def _on_repeat_result(rr: RepeatResult) -> None:
         all_repeat_results.append(rr)
@@ -831,10 +946,12 @@ def main() -> None:
                 max_model_len_override=args.max_model_len,
                 continue_on_error=continue_on_error,
                 on_repeat_result=_on_repeat_result,
+                progress_log_every_batch=progress_log_every_batch,
             )
             load_times[scenario] = load_time_s
             metadata_payload["load_times"] = load_times
             _write_run_metadata(metadata_path, metadata_payload)
+            _invoke_after_checkpoint_hook()
             print(f"{scenario} load_time_s={load_time_s:.2f}")
 
         metadata_payload["status"] = "completed"
@@ -845,6 +962,7 @@ def main() -> None:
         metadata_payload["finished_utc"] = datetime.now(timezone.utc).isoformat()
         metadata_payload["error"] = str(e)
         _write_run_metadata(metadata_path, metadata_payload)
+        _invoke_after_checkpoint_hook()
         raise
 
     print(f"\nWrote summary: {txt_path}")

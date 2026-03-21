@@ -1,6 +1,6 @@
 # Modal Phase C: DeepSeek-V3 base + Jane Street dormant on the `dormant-models` volume.
-# Used by `dormant/modal/vllm_phase_c_speed_check_modal.py` → concurrency_speed_tests.py
-# with `--real-weights` (default Modal entrypoint uses dummy YAML instead).
+# Used by `vllm_lda_experiment_modal.py` / `vllm_phase_c_speed_check_modal.py` →
+# concurrency_speed_tests.py with `--real-weights` (dummy YAMLs are the default).
 #
 # max_model_len 256 + max_new_tokens 128 (fits bundled prompts ~107 tok + 128 gen).
 # enforce_eager + max_num_batched_tokens 256 reduce init time / peak VRAM vs 4096.

@@ -13,6 +13,27 @@ Configure runs with `benchmark.scenarios`, e.g. `["vanilla", "lda"]` (default) o
 Long runs can fail late (e.g. CUDA errors). The benchmark script now writes
 checkpointed results after each completed repeat, so partial progress is kept.
 
+## Prompt count vs concurrency
+
+The harness submits **chunks of size `concurrency`** (`messages[i : i+concurrency]`). If
+`len(prompts) < concurrency`, the first batch has **only that many** requests in flight, so
+you never stress the target parallelism. Use:
+
+- **`n_prompts >= max(benchmark.concurrencies)`** so the first wave can fill, and
+- **several waves** (e.g. 5000 prompts at concurrency 512 → many waves) so timing reflects
+  steady scheduling, not a single short batch.
+
+**Normalized lmsys pack (5k, recommended for Modal + HF LDA):** built from the `dormant` repo (HF access / lmsys cache):
+
+```bash
+cd /path/to/dormant
+python3 modal/scripts/build_lda_prompt_pack.py
+```
+
+Output: `dormant/modal/data/lda_dsv3_dormant1_round1/prompts_n5000_s42.csv` → in the Modal image **`/root/modal_data/lda_dsv3_dormant1_round1/prompts_n5000_s42.csv`**. **LDA experiment** (5k, concurrency 512, dummy weights) YAML lives in **`dormant/modal/config/lda_dummy_experiment_lmsys.yaml`** → worker **`/root/modal_pkg/config/lda_dummy_experiment_lmsys.yaml`**; default for [`vllm_lda_experiment_modal.py`](../../../dormant/modal/vllm_lda_experiment_modal.py). For local `concurrency_speed_tests.py`, pass that path with `--config` (absolute path to your checkout).
+
+**Small ad-hoc export** (e.g. 1k in this folder only): `export_lmsys_prompts_for_speed_check.py` → `prompts_lmsys_n1000_s42.csv`; Modal path `/root/vllm_speed_checks/prompts_lmsys_n1000_s42.csv`.
+
 ## Safety: immutable run checkout
 
 Do **not** modify bind-mounted runtime code while a benchmark is running.
@@ -42,12 +63,16 @@ python -u test/speed_checks/concurrency_speed_tests.py
 
 ### Modal (Phase C, DeepSeek + dormant)
 
-The `dormant/modal` app [`vllm_phase_c_speed_check_modal.py`](../../../dormant/modal/vllm_phase_c_speed_check_modal.py) bakes this folder into the worker at `/root/vllm_speed_checks`.
+The `dormant/modal` apps [`vllm_lda_experiment_modal.py`](../../../dormant/modal/vllm_lda_experiment_modal.py) (canonical **5k** science runs → `lda_experiments/`) and [`vllm_phase_c_speed_check_modal.py`](../../../dormant/modal/vllm_phase_c_speed_check_modal.py) (legacy benchmark defaults → `vllm_speed_checks/`) bake this folder into the worker at `/root/vllm_speed_checks`. See [`dormant/modal/EXPERIMENTS.md`](../../../dormant/modal/EXPERIMENTS.md).
 
-- **Default:** [`config_modal_phase_c_lda_dummy.yaml`](config_modal_phase_c_lda_dummy.yaml) — `load_format=dummy`, same HF DeepSeek-V3 id for base and dormant, **max_model_len=256**, **max_new_tokens=128**, **enforce_eager**, **max_num_batched_tokens=256** (256 context + stock CSV → gen capped at 128; for 256-token gen, raise to 384/256 as in comments in [`config_modal_phase_c_lda.yaml`](config_modal_phase_c_lda.yaml)).
+- **Speed-check default:** [`config_modal_phase_c_lda_dummy.yaml`](config_modal_phase_c_lda_dummy.yaml) — `load_format=dummy`, same HF DeepSeek-V3 id for base and dormant, **max_model_len=256**, **max_new_tokens=128**, **enforce_eager**, **max_num_batched_tokens=256** (256 context + stock CSV → gen capped at 128; for 256-token gen, raise to 384/256 as in comments in [`config_modal_phase_c_lda.yaml`](config_modal_phase_c_lda.yaml)).
 - **`--real-weights`:** [`config_modal_phase_c_lda.yaml`](config_modal_phase_c_lda.yaml) — volume paths, same length / init knobs.
 
-512 prompts, LDA-only, concurrency 128/180/256 by default. Results: `/models/results/vllm_speed_checks/<run_id>/` on the Modal volume.
+**Modal CLI:** omitting **`--concurrencies`** / **`--scenarios`** lets the chosen YAML’s **`benchmark.concurrencies`** and **`benchmark.scenarios`** apply (instead of old hardcoded Modal defaults). Use **`--prompts-csv /root/modal_data/...csv`** for the 5k pack, or **`/root/vllm_speed_checks/...csv`** for exports co-located with this folder.
+
+**Progress during a repeat:** after each **`llm.chat`** batch, the harness logs prompts finished, cumulative output tokens, seconds elapsed for that repeat, and rolling **`out_tok/s`** (excludes model load). Set **`benchmark.progress_log_every_batches`** in YAML or **`--progress-log-every-batches N`** (0 = off).
+
+Results: **`/models/results/lda_experiments/<run_id>/`** (experiment app) or **`/models/results/vllm_speed_checks/<run_id>/`** (legacy app). Use **`--run-label my-purpose`** for a human id (`yymmdd-HHMM-my-purpose-<n>` UTC). The harness rewrites **`concurrency_speed_tests.txt`**, **`.csv`**, and **`run_metadata.json` after each concurrency repeat** (and calls Modal **`volume.commit()`** when run via either Modal app).
 
 LDA **KV headroom:** set `additional_config.lda.kv_cache_max_memory_gib` to cap per-worker KV bytes **before** block planning (`get_kv_cache_configs`). When this key is set, `kv_cache_safety_fraction` defaults to **1.0** (no extra shrink); omit the cap to fall back to **`kv_cache_safety_fraction` default 0.88**. Modal YAMLs use **`gpu_memory_utilization: 0.85`** plus a GiB cap; tune the cap (and optionally `kv_cache_safety_fraction`) if init OOM or KV starvation persists.
 
