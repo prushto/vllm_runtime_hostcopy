@@ -21,6 +21,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 import vllm.envs as envs
+from vllm._agent_debug_ndjson import agent_debug_log
 from vllm.attention.layer import Attention, MLAAttention
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
@@ -4164,6 +4165,14 @@ class GPUModelRunner(
             time_after_load - time_before_load,
             scope="local",
         )
+        # region agent log
+        agent_debug_log(
+            "H6",
+            "gpu_model_runner.py:load_model:after_weight_log",
+            "after Model loading took log, before prepare_communication_buffer",
+            {"tp_rank": get_tp_group().rank_in_group},
+        )
+        # endregion
         prepare_communication_buffer_for_model(self.model)
         if (drafter := getattr(self, "drafter", None)) and (
             drafter_model := getattr(drafter, "model", None)
@@ -4204,6 +4213,14 @@ class GPUModelRunner(
             backend = self.vllm_config.compilation_config.init_backend(self.vllm_config)
             compilation_counter.stock_torch_compile_count += 1
             self.model.compile(fullgraph=True, backend=backend)
+            # region agent log
+            agent_debug_log(
+                "H6",
+                "gpu_model_runner.py:load_model:complete_compile_path",
+                "load_model finished (STOCK_TORCH_COMPILE)",
+                {"tp_rank": get_tp_group().rank_in_group},
+            )
+            # endregion
             return
         # for other compilation modes, cudagraph behavior is controlled by
         # CudagraphWraper and CudagraphDispatcher of vllm.
@@ -4227,6 +4244,14 @@ class GPUModelRunner(
                 self.model = UBatchWrapper(
                     self.model, self.vllm_config, CUDAGraphMode.NONE, self.device
                 )
+        # region agent log
+        agent_debug_log(
+            "H6",
+            "gpu_model_runner.py:load_model:complete",
+            "load_model finished",
+            {"tp_rank": get_tp_group().rank_in_group},
+        )
+        # endregion
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
@@ -5014,9 +5039,28 @@ class GPUModelRunner(
                         self.encoder_cache[f"tmp_{i}"] = output
 
         # Add `is_profile` here to pre-allocate communication buffers
+        # region agent log
+        agent_debug_log(
+            "H1",
+            "gpu_model_runner.py:profile_run:before_dummy_run",
+            "about to _dummy_run for profile",
+            {
+                "tp_rank": get_tp_group().rank_in_group,
+                "num_tokens": int(self.max_num_tokens),
+            },
+        )
+        # endregion
         hidden_states, last_hidden_states = self._dummy_run(
             self.max_num_tokens, is_profile=True
         )
+        # region agent log
+        agent_debug_log(
+            "H1",
+            "gpu_model_runner.py:profile_run:after_dummy_run",
+            "_dummy_run returned",
+            {"tp_rank": get_tp_group().rank_in_group},
+        )
+        # endregion
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:
                 output = self._dummy_pooler_run(hidden_states)

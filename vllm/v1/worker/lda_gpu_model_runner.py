@@ -18,7 +18,8 @@ from vllm.attention.layer import Attention
 from vllm.config import ModelConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
+from vllm.v1.core.kv_cache_utils import scale_kv_cache_config
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.lda_kl_utils import kl_divergence_dormant_base, lda_blend_logits
 from vllm.v1.worker.utils import bind_kv_cache
@@ -27,42 +28,6 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
-
-
-def _page_size_for_tensor(config: KVCacheConfig, layer_name: str) -> int:
-    """Return page_size_bytes for the group that contains the given layer."""
-    for group in config.kv_cache_groups:
-        if layer_name in group.layer_names:
-            return group.kv_cache_spec.page_size_bytes
-    raise KeyError(f"Layer {layer_name!r} not in any kv_cache_group")
-
-
-def _scale_kv_cache_config(config: KVCacheConfig, scale: float) -> KVCacheConfig:
-    """Return a new KVCacheConfig with num_blocks and tensor sizes scaled.
-
-    Scaled tensor sizes are aligned down to a multiple of page_size_bytes so
-    that _reshape_kv_cache_tensors' assertion (raw_tensor.numel() % page_size_bytes == 0)
-    holds.
-    """
-    new_num_blocks = max(1, int(config.num_blocks * scale))
-    new_tensors = []
-    for t in config.kv_cache_tensors:
-        if not t.shared_by:
-            new_tensors.append(
-                KVCacheTensor(size=max(1, int(t.size * scale)), shared_by=list(t.shared_by))
-            )
-            continue
-        page_size = _page_size_for_tensor(config, t.shared_by[0])
-        scaled = max(1, int(t.size * scale))
-        # Align down to a multiple of page_size so reshape assertion holds.
-        size = (scaled // page_size) * page_size
-        size = max(page_size, size)
-        new_tensors.append(KVCacheTensor(size=size, shared_by=list(t.shared_by)))
-    return KVCacheConfig(
-        num_blocks=new_num_blocks,
-        kv_cache_tensors=new_tensors,
-        kv_cache_groups=config.kv_cache_groups,
-    )
 
 
 class LDAGPUModelRunner(GPUModelRunner):
@@ -143,8 +108,8 @@ class LDAGPUModelRunner(GPUModelRunner):
         return out
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
-        config_main = _scale_kv_cache_config(kv_cache_config, 0.5)
-        config_dormant = _scale_kv_cache_config(kv_cache_config, 0.5)
+        config_main = scale_kv_cache_config(kv_cache_config, 0.5)
+        config_dormant = scale_kv_cache_config(kv_cache_config, 0.5)
         super().initialize_kv_cache(config_main)
         self._initialize_dormant_kv_cache(config_dormant)
 

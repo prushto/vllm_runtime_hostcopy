@@ -331,6 +331,18 @@ def _build_llm_kwargs(
     ac = _additional_config_for_scenario(cfg, scenario)
     if ac is not None:
         kwargs["additional_config"] = ac
+
+    # Optional large-model / Modal knobs (omitted when absent — keeps local Qwen runs unchanged).
+    for key in ("tensor_parallel_size", "max_num_batched_tokens"):
+        val = cfg.get(key)
+        if val is not None:
+            kwargs[key] = int(val)
+    for key in ("trust_remote_code", "enforce_eager", "enable_expert_parallel"):
+        if key in cfg and cfg[key] is not None:
+            kwargs[key] = bool(cfg[key])
+    if cfg.get("load_format") is not None:
+        kwargs["load_format"] = str(cfg["load_format"])
+
     return kwargs
 
 

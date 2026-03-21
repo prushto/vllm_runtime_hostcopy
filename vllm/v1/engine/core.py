@@ -16,6 +16,7 @@ from typing import Any, TypeVar, cast
 import msgspec
 import zmq
 
+from vllm._agent_debug_ndjson import agent_debug_log
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.envs import enable_envs_cache
@@ -38,6 +39,7 @@ from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_configs,
     get_request_block_hasher,
     init_none_hash,
+    scale_kv_cache_config,
 )
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -220,10 +222,26 @@ class EngineCore:
     def _initialize_kv_caches(
         self, vllm_config: VllmConfig
     ) -> tuple[int, int, KVCacheConfig]:
+        # region agent log
+        agent_debug_log(
+            "H2",
+            "core.py:_initialize_kv_caches:entry",
+            "kv cache init started",
+            {},
+        )
+        # endregion
         start = time.time()
 
         # Get all kv cache needed by the model
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
+        # region agent log
+        agent_debug_log(
+            "H2",
+            "core.py:_initialize_kv_caches:after_specs",
+            "get_kv_cache_specs returned",
+            {"n_specs": len(kv_cache_specs)},
+        )
+        # endregion
 
         has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
         if has_kv_cache:
@@ -239,7 +257,31 @@ class EngineCore:
             else:
                 # Profiles the peak memory usage of the model to determine how
                 # much memory can be allocated for kv cache.
+                # region agent log
+                agent_debug_log(
+                    "H1",
+                    "core.py:_initialize_kv_caches:before_determine",
+                    "calling model_executor.determine_available_memory",
+                    {},
+                )
+                t_det0 = time.time()
+                # endregion
                 available_gpu_memory = self.model_executor.determine_available_memory()
+                # region agent log
+                agent_debug_log(
+                    "H1",
+                    "core.py:_initialize_kv_caches:after_determine",
+                    "determine_available_memory returned",
+                    {
+                        "elapsed_s": round(time.time() - t_det0, 3),
+                        "first_bytes": (
+                            int(available_gpu_memory[0])
+                            if available_gpu_memory
+                            else None
+                        ),
+                    },
+                )
+                # endregion
                 self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
         else:
             # Attention free models don't need memory for kv cache
@@ -247,12 +289,55 @@ class EngineCore:
 
         assert len(kv_cache_specs) == len(available_gpu_memory)
 
+        lda_cfg = (vllm_config.additional_config or {}).get("lda")
+        if (
+            has_kv_cache
+            and isinstance(lda_cfg, dict)
+            and lda_cfg.get("dormant_model")
+        ):
+            cap_raw = lda_cfg.get("kv_cache_max_memory_gib")
+            if cap_raw is not None:
+                cap_bytes = int(float(cap_raw) * (1024**3))
+                before0 = int(available_gpu_memory[0]) if available_gpu_memory else 0
+                available_gpu_memory = [
+                    min(int(x), cap_bytes) for x in available_gpu_memory
+                ]
+                after0 = int(available_gpu_memory[0]) if available_gpu_memory else 0
+                logger.info(
+                    "LDA: capped per-worker KV budget to %.4f GiB "
+                    "(kv_cache_max_memory_gib): first worker %d -> %d bytes",
+                    float(cap_raw),
+                    before0,
+                    after0,
+                )
+        if has_kv_cache and available_gpu_memory:
+            self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
+
         # Track max_model_len before KV cache config to detect auto-fit changes
         max_model_len_before = vllm_config.model_config.max_model_len
 
         kv_cache_configs = get_kv_cache_configs(
             vllm_config, kv_cache_specs, available_gpu_memory
         )
+
+        if isinstance(lda_cfg, dict) and lda_cfg.get("dormant_model"):
+            if "kv_cache_safety_fraction" in lda_cfg:
+                frac = float(lda_cfg["kv_cache_safety_fraction"])
+            elif lda_cfg.get("kv_cache_max_memory_gib") is not None:
+                # Explicit GiB cap already limits KV; avoid stacking 0.88 on top.
+                frac = 1.0
+            else:
+                frac = 0.88
+            frac = max(0.05, min(frac, 1.0))
+            if frac < 1.0 - 1e-9:
+                kv_cache_configs = [
+                    scale_kv_cache_config(cfg, frac) for cfg in kv_cache_configs
+                ]
+                logger.info(
+                    "LDA: applied kv_cache_safety_fraction=%.4f to KV cache configs "
+                    "(reserve GPU memory headroom for dual-model KV allocation).",
+                    frac,
+                )
 
         # If auto-fit reduced max_model_len, sync the new value to workers.
         # This is needed because workers were spawned before memory profiling
@@ -266,7 +351,24 @@ class EngineCore:
         num_cpu_blocks = 0
 
         # Initialize kv cache and warmup the execution
+        # region agent log
+        agent_debug_log(
+            "H4",
+            "core.py:_initialize_kv_caches:before_init_from_config",
+            "calling initialize_from_config",
+            {"num_gpu_blocks": num_gpu_blocks},
+        )
+        t_ifc0 = time.time()
+        # endregion
         self.model_executor.initialize_from_config(kv_cache_configs)
+        # region agent log
+        agent_debug_log(
+            "H4",
+            "core.py:_initialize_kv_caches:after_init_from_config",
+            "initialize_from_config returned",
+            {"elapsed_s": round(time.time() - t_ifc0, 3)},
+        )
+        # endregion
 
         elapsed = time.time() - start
         logger.info_once(

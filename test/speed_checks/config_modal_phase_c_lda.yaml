@@ -1,0 +1,48 @@
+# Modal Phase C: DeepSeek-V3 base + Jane Street dormant on the `dormant-models` volume.
+# Used by `dormant/modal/vllm_phase_c_speed_check_modal.py` → concurrency_speed_tests.py
+# with `--real-weights` (default Modal entrypoint uses dummy YAML instead).
+#
+# max_model_len 256 + max_new_tokens 128 (fits bundled prompts ~107 tok + 128 gen).
+# enforce_eager + max_num_batched_tokens 256 reduce init time / peak VRAM vs 4096.
+#
+# --- Optional: 256-token generations → set max_model_len: 384, max_new_tokens: 256,
+#     max_num_batched_tokens: 384 (and same in dummy YAML).
+# Override concurrency on the CLI: `--concurrencies 128 180 256`.
+
+base_model_id: "/models/deepseek-ai/DeepSeek-V3"
+dormant_model_id: "/models/jane-street/dormant-model-1"
+lda_alpha: 0.5
+gpu_memory_utilization: 0.85
+max_model_len: 256
+
+tensor_parallel_size: 8
+max_num_batched_tokens: 256
+trust_remote_code: true
+enforce_eager: true
+enable_expert_parallel: false
+
+additional_config:
+  lda:
+    collect_kl: true
+    kv_cache_max_memory_gib: 8
+
+gen_config:
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
+  repetition_penalty: 1.05
+  max_new_tokens: 128
+  do_sample: true
+
+benchmark:
+  scenarios: ["lda"]
+  n_prompts: 512
+  concurrencies: [128, 180, 256]
+  repeats: 1
+  warmup: false
+  seed: 42
+  continue_on_error: true
+  length_mix:
+    short: 0.4
+    medium: 0.4
+    long: 0.2

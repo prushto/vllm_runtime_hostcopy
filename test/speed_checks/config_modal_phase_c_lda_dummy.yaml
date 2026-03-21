@@ -1,0 +1,49 @@
+# Modal Phase C — **dummy weights** (cheap iteration: no volume checkpoint I/O).
+# Same LDA path as real config; HF ids must match architecture (both DeepSeek-V3).
+#
+# max_model_len 256 (strict). Bundled prompts.csv longest ~107 tok → max_new_tokens 128
+# keeps prompt+gen under 256. For 256-token *generations*, use max_model_len ≥ 384 and
+# max_new_tokens: 256 (raise max_model_len to ≥384 in both Modal YAMLs).
+#
+# enforce_eager + load_format dummy + small max_num_batched_tokens → fast init, low VRAM.
+
+base_model_id: "deepseek-ai/DeepSeek-V3"
+dormant_model_id: "deepseek-ai/DeepSeek-V3"
+lda_alpha: 0.5
+gpu_memory_utilization: 0.85
+max_model_len: 256
+
+load_format: "dummy"
+tensor_parallel_size: 8
+max_num_batched_tokens: 256
+trust_remote_code: true
+enforce_eager: true
+enable_expert_parallel: false
+
+additional_config:
+  lda:
+    collect_kl: true
+    # Per-GPU KV budget (bytes cap before get_kv_cache_configs). Required headroom when
+    # LDA loads a second full model; raise if init passes but concurrency starves KV.
+    kv_cache_max_memory_gib: 8
+
+gen_config:
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
+  repetition_penalty: 1.05
+  max_new_tokens: 128
+  do_sample: true
+
+benchmark:
+  scenarios: ["lda"]
+  n_prompts: 512
+  concurrencies: [128, 180, 256]
+  repeats: 1
+  warmup: false
+  seed: 42
+  continue_on_error: true
+  length_mix:
+    short: 0.4
+    medium: 0.4
+    long: 0.2

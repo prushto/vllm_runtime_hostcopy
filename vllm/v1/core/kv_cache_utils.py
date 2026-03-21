@@ -1250,6 +1250,44 @@ def get_kv_cache_groups(
     return _get_kv_cache_groups_uniform_page_size(kv_cache_spec)
 
 
+def _page_size_for_kv_tensor(config: KVCacheConfig, layer_name: str) -> int:
+    for group in config.kv_cache_groups:
+        if layer_name in group.layer_names:
+            return group.kv_cache_spec.page_size_bytes
+    raise KeyError(f"Layer {layer_name!r} not in any kv_cache_group")
+
+
+def scale_kv_cache_config(config: KVCacheConfig, scale: float) -> KVCacheConfig:
+    """Return a new ``KVCacheConfig`` with ``num_blocks`` and tensor sizes scaled.
+
+    Used by LDA to reserve headroom: profiling can overestimate how much KV
+    memory is allocatable after two full models are resident.
+
+    Scaled tensor sizes are aligned down to a multiple of ``page_size_bytes`` so
+    ``_reshape_kv_cache_tensors`` invariants hold.
+    """
+    new_num_blocks = max(1, int(config.num_blocks * scale))
+    new_tensors: list[KVCacheTensor] = []
+    for t in config.kv_cache_tensors:
+        if not t.shared_by:
+            new_tensors.append(
+                KVCacheTensor(
+                    size=max(1, int(t.size * scale)), shared_by=list(t.shared_by)
+                )
+            )
+            continue
+        page_size = _page_size_for_kv_tensor(config, t.shared_by[0])
+        scaled = max(1, int(t.size * scale))
+        size = (scaled // page_size) * page_size
+        size = max(page_size, size)
+        new_tensors.append(KVCacheTensor(size=size, shared_by=list(t.shared_by)))
+    return KVCacheConfig(
+        num_blocks=new_num_blocks,
+        kv_cache_tensors=new_tensors,
+        kv_cache_groups=config.kv_cache_groups,
+    )
+
+
 def generate_scheduler_kv_cache_config(
     kv_cache_configs: list[KVCacheConfig],
 ) -> KVCacheConfig:

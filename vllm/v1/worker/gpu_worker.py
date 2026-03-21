@@ -14,6 +14,7 @@ import torch.distributed
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm._agent_debug_ndjson import agent_debug_log
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode
 from vllm.distributed import (
@@ -299,10 +300,34 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
+        # region agent log
+        agent_debug_log(
+            "H1",
+            "gpu_worker.py:determine_available_memory:entry",
+            "worker determine_available_memory entered",
+            {"rank": self.rank, "local_rank": self.local_rank},
+        )
+        # endregion
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
+            # region agent log
+            agent_debug_log(
+                "H1",
+                "gpu_worker.py:determine_available_memory:before_profile_kv_bytes",
+                "calling profile_run (kv_cache_memory_bytes branch)",
+                {"rank": self.rank},
+            )
+            # endregion
             self.model_runner.profile_run()
+            # region agent log
+            agent_debug_log(
+                "H1",
+                "gpu_worker.py:determine_available_memory:after_profile_kv_bytes",
+                "profile_run returned (kv_cache_memory_bytes branch)",
+                {"rank": self.rank},
+            )
+            # endregion
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -325,7 +350,23 @@ class Worker(WorkerBase):
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
+            # region agent log
+            agent_debug_log(
+                "H1",
+                "gpu_worker.py:determine_available_memory:before_profile_default",
+                "calling profile_run (default memory_profiling branch)",
+                {"rank": self.rank},
+            )
+            # endregion
             self.model_runner.profile_run()
+            # region agent log
+            agent_debug_log(
+                "H1",
+                "gpu_worker.py:determine_available_memory:after_profile_default",
+                "profile_run returned (default branch)",
+                {"rank": self.rank},
+            )
+            # endregion
 
         self.non_torch_memory = profile_result.non_torch_increase
         self.peak_activation_memory = profile_result.torch_peak_increase
