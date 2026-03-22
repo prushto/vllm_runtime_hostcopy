@@ -187,6 +187,10 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
+    # LDA only: per-request KL(dormant||base) for tokens sampled this step;
+    # outer index matches req_id_to_index / sampled_token_ids (non-spec decode).
+    lda_kl_for_sampled_tokens: list[list[float]] | None = None
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

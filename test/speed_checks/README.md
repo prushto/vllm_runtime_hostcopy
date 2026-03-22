@@ -30,7 +30,7 @@ cd /path/to/dormant
 python3 modal/scripts/build_lda_prompt_pack.py
 ```
 
-Output: `dormant/modal/data/lda_dsv3_dormant1_round1/prompts_n5000_s42.csv` → in the Modal image **`/root/modal_data/lda_dsv3_dormant1_round1/prompts_n5000_s42.csv`**. **LDA experiment (default, real weights):** [`dormant/modal/config/lda_experiment_lmsys.yaml`](../../../dormant/modal/config/lda_experiment_lmsys.yaml) → **`/root/modal_pkg/config/lda_experiment_lmsys.yaml`** for [`vllm_lda_experiment_modal.py`](../../../dormant/modal/vllm_lda_experiment_modal.py). Dummy smoke: `lda_dummy_experiment_lmsys.yaml` + **`--dummy-weights`**. For local `concurrency_speed_tests.py`, pass `--config` with an absolute path to either YAML.
+Output: `dormant/modal/data/lda_dsv3_dormant1_round1/prompts_n5000_s42.csv` → in the Modal image **`/root/modal_data/lda_dsv3_dormant1_round1/prompts_n5000_s42.csv`**. **Modal round 1 (default, real checkpoints):** [`dormant/modal/config/lda_dsv3_dormant1_round1.yaml`](../../../dormant/modal/config/lda_dsv3_dormant1_round1.yaml) → **`/root/modal_pkg/config/lda_dsv3_dormant1_round1.yaml`** for [`vllm_lda_experiment_modal.py`](../../../dormant/modal/vllm_lda_experiment_modal.py). Dummy debug: `lda_dsv3_dormant1_round1_dummy_debug.yaml` + **`--dummy-weights`**. For local `concurrency_speed_tests.py`, pass `--config` with an absolute path to either YAML.
 
 **Small ad-hoc export** (e.g. 1k in this folder only): `export_lmsys_prompts_for_speed_check.py` → `prompts_lmsys_n1000_s42.csv`; Modal path `/root/vllm_speed_checks/prompts_lmsys_n1000_s42.csv`.
 

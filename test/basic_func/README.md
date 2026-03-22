@@ -19,4 +19,4 @@ Merged with `dormant_model` / `lda_alpha` from `LLM(...)` kwargs. Useful keys:
 - **`validate_same_checkpoint`** (bool): When `dormant_model` equals `model`, assert dormant logits ≈ base logits and KL(dormant‖base) is small each forward. Also set env `VLLM_LDA_VALIDATE_SAME_CHECKPOINT=1`.
 - **`validation_logits_rtol`**, **`validation_logits_atol`**: `torch.allclose` tolerances (defaults tuned for bf16).
 - **`validation_kl_max`**: Maximum allowed KL(dormant‖base) per row during validation.
-- **`collect_kl`** (bool): Each LDA forward computes KL and stores `max`/`mean` on the runner (`_lda_last_kl_max`, `_lda_last_kl_mean`) for benchmarking—**two extra softmax passes** vs blend-only.
+- **`collect_kl`** (bool): Each LDA forward computes KL—**two extra softmax passes** vs blend-only. Also stores `max`/`mean` on the runner (`_lda_last_kl_max`, `_lda_last_kl_mean`) and exports per-completion **mean/max over generated tokens** on `CompletionOutput` (`mean_kl_divergence` / `max_kl_divergence`) for batch harnesses (non–speculative-decode only).

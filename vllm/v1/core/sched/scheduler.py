@@ -1235,6 +1235,7 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        lda_kl_for_sampled = model_runner_output.lda_kl_for_sampled_tokens
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1366,6 +1367,18 @@ class Scheduler(SchedulerInterface):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+
+            lda_kl_for_new_tokens = None
+            if (
+                lda_kl_for_sampled is not None
+                and new_token_ids
+                and req_index < len(lda_kl_for_sampled)
+            ):
+                kl_step = lda_kl_for_sampled[req_index]
+                n_tok = len(new_token_ids)
+                if kl_step and len(kl_step) >= n_tok:
+                    lda_kl_for_new_tokens = kl_step[:n_tok]
+
             if (
                 new_token_ids
                 or pooler_output is not None
@@ -1388,6 +1401,7 @@ class Scheduler(SchedulerInterface):
                         num_cached_tokens=request.num_cached_tokens,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        lda_kl_for_new_tokens=lda_kl_for_new_tokens,
                     )
                 )
             else:

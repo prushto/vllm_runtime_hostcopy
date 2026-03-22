@@ -47,6 +47,9 @@ class CompletionOutput:
     finish_reason: str | None = None
     stop_reason: int | str | None = None
     lora_request: LoRARequest | None = None
+    # LDA: KL(dormant||base) aggregated over generated tokens (set on final chunk).
+    mean_kl_divergence: float | None = None
+    max_kl_divergence: float | None = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None
@@ -168,6 +171,13 @@ class RequestOutput:
                         )
                         completion.finish_reason = next_completion.finish_reason
                         completion.stop_reason = next_completion.stop_reason
+                        if next_completion.finish_reason is not None:
+                            completion.mean_kl_divergence = (
+                                next_completion.mean_kl_divergence
+                            )
+                            completion.max_kl_divergence = (
+                                next_completion.max_kl_divergence
+                            )
                     else:
                         # Replace the output with the new one
                         self.outputs[i] = next_completion

@@ -53,6 +53,8 @@ class LDAGPUModelRunner(GPUModelRunner):
         self._lda_collect_kl: bool = bool(lda.get("collect_kl", False))
         self._lda_last_kl_max: float | None = None
         self._lda_last_kl_mean: float | None = None
+        # Per-logits-row KL for this step (CPU), exported when collect_kl (non-spec decode).
+        self._lda_kl_row_cpu: list[float] | None = None
 
         # Optional: assert identical logits / near-zero KL when main and dormant
         # checkpoints are the same (see test_lda_same_model_validate.py).
@@ -196,7 +198,9 @@ class LDAGPUModelRunner(GPUModelRunner):
         num_scheduled_tokens: int,
     ) -> torch.Tensor:
         if self.dormant is None:
+            self._lda_kl_row_cpu = None
             return logits
+        self._lda_kl_row_cpu = None
         from vllm.forward_context import set_forward_context
         with set_forward_context(
             attn_metadata,
@@ -221,6 +225,7 @@ class LDAGPUModelRunner(GPUModelRunner):
             if self._lda_collect_kl:
                 self._lda_last_kl_max = float(kl_row.max().item())
                 self._lda_last_kl_mean = float(kl_row.mean().item())
+                self._lda_kl_row_cpu = kl_row.detach().float().cpu().tolist()
             if self._lda_validate_same and self._lda_same_checkpoint_paths():
                 if not torch.allclose(
                     dormant_logits,
@@ -242,3 +247,38 @@ class LDAGPUModelRunner(GPUModelRunner):
                     )
         amplified = lda_blend_logits(dormant_logits, logits, alpha)
         return amplified.to(logits.dtype).to(logits.device)
+
+    def _lda_kl_for_sampled_tokens_step(
+        self,
+        valid_sampled_token_ids: list[list[int]],
+        invalid_req_indices: list[int],
+        max_gen_len: int,
+    ) -> list[list[float]] | None:
+        """Build per-request KL lists aligned with sampled tokens (non-spec decode only)."""
+        del invalid_req_indices  # discard is already reflected as empty token lists
+        if not self._lda_collect_kl or not self._lda_kl_row_cpu:
+            return None
+        if max_gen_len != 1:
+            logger.warning_once(
+                "LDA KL export skipped: speculative decode (max_gen_len=%s) "
+                "is not supported for per-token KL.",
+                max_gen_len,
+            )
+            return None
+        n_kl = len(self._lda_kl_row_cpu)
+        n_req = len(valid_sampled_token_ids)
+        if n_req == 0 or n_kl != n_req:
+            logger.warning_once(
+                "LDA KL export skipped: length mismatch (kl_rows=%s, num_reqs=%s).",
+                n_kl,
+                n_req,
+            )
+            return None
+        out: list[list[float]] = []
+        for req_idx in range(n_req):
+            toks = valid_sampled_token_ids[req_idx]
+            if not toks:
+                out.append([])
+            else:
+                out.append([float(self._lda_kl_row_cpu[req_idx])])
+        return out

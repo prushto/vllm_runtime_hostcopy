@@ -146,6 +146,9 @@ class EngineCoreOutput(
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
 
+    # LDA: KL(dormant||base) per new_token_ids position (same length when set).
+    lda_kl_for_new_tokens: list[float] | None = None
+
     @property
     def finished(self) -> bool:
         return self.finish_reason is not None

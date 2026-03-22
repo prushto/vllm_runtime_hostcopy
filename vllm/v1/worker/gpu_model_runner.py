@@ -3036,6 +3036,16 @@ class GPUModelRunner(
         """Override in subclasses to modify logits before sampling (e.g. LDA blend)."""
         return logits
 
+    def _lda_kl_for_sampled_tokens_step(
+        self,
+        valid_sampled_token_ids: list[list[int]],
+        invalid_req_indices: list[int],
+        max_gen_len: int,
+    ) -> list[list[float]] | None:
+        """LDA hook: per-request KL for this step. Base returns None."""
+        del valid_sampled_token_ids, invalid_req_indices, max_gen_len
+        return None
+
     @staticmethod
     def _is_uniform_decode(
         max_num_scheduled_tokens: int,
@@ -3747,6 +3757,13 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
 
+        max_gen_len = int(sampler_output.sampled_token_ids.shape[-1])
+        lda_kl_for_sampled_tokens = self._lda_kl_for_sampled_tokens_step(
+            valid_sampled_token_ids,
+            invalid_req_indices,
+            max_gen_len,
+        )
+
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.model_config.enable_return_routed_experts:
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -3767,6 +3784,7 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                lda_kl_for_sampled_tokens=lda_kl_for_sampled_tokens,
             )
 
         if not self.use_async_scheduling:

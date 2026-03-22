@@ -174,6 +174,9 @@ class RequestState:
         self.stream_interval = stream_interval
         self.sent_tokens_offset = 0  # Offset of sent tokens
 
+        # LDA: per-output-token KL(dormant||base); mean/max on completion.
+        self.lda_kl_values: list[float] = []
+
         # Streaming input queue
         self.streaming_input = stream_input
         self.input_chunk_queue: deque[StreamingUpdate] | None = (
@@ -391,6 +394,13 @@ class RequestState:
         if delta and logprobs:
             logprobs = logprobs[-len(token_ids) :]
 
+        mean_kl = None
+        max_kl = None
+        if finished and self.lda_kl_values:
+            vals = self.lda_kl_values
+            mean_kl = float(sum(vals)) / len(vals)
+            max_kl = float(max(vals))
+
         return CompletionOutput(
             index=self.request_index,
             text=text,
@@ -400,6 +410,8 @@ class RequestState:
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
             stop_reason=stop_reason if finished else None,
+            mean_kl_divergence=mean_kl,
+            max_kl_divergence=max_kl,
         )
 
     def _new_pooling_output(self, pooling_output: torch.Tensor) -> PoolingOutput:
@@ -624,6 +636,11 @@ class OutputProcessor:
             routed_experts = engine_core_output.routed_experts
             req_state.num_cached_tokens = engine_core_output.num_cached_tokens
             req_state.is_prefilling = False
+
+            if engine_core_output.lda_kl_for_new_tokens:
+                req_state.lda_kl_values.extend(
+                    engine_core_output.lda_kl_for_new_tokens
+                )
 
             if pooling_output is None:
                 assert req_state.detokenizer is not None

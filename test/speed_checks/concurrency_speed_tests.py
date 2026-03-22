@@ -8,6 +8,11 @@ This script benchmarks two scenarios on the same prompt set:
 It measures model load time separately from generation time, and writes both
 human-readable and machine-readable reports under test_results/.
 
+With ``benchmark.save_generations: true`` (or ``--save-generations``), each
+``llm.chat`` batch also appends one JSON object per prompt to
+``<run_dir>/generations.jsonl`` (UTF-8, flushed after every batch) so long Modal
+runs can checkpoint completions onto the volume via the after-checkpoint hook.
+
 **LDA α sweep:** set ``benchmark.lda_alphas: [0.5, 1.0, 3.0]`` (or root ``lda_alphas``).
 Each value runs ``lda`` / ``lda_kl`` with a fresh ``LLM`` (``lda_alpha`` is fixed at init).
 ``vanilla`` runs once. CSV/txt include an ``lda_alpha`` column / suffix where applicable.
@@ -27,7 +32,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TextIO
 
 import yaml
 
@@ -152,6 +157,12 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help="Log every N completed llm.chat batches during a repeat (1=every batch). "
         "0 disables. Default: benchmark.progress_log_every_batches or 1.",
+    )
+    parser.add_argument(
+        "--save-generations",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Append per-prompt completions to run_dir/generations.jsonl (default: benchmark.save_generations).",
     )
     return parser.parse_args()
 
@@ -399,7 +410,12 @@ def _build_llm_kwargs(
         val = cfg.get(key)
         if val is not None:
             kwargs[key] = int(val)
-    for key in ("trust_remote_code", "enforce_eager", "enable_expert_parallel"):
+    for key in (
+        "trust_remote_code",
+        "enforce_eager",
+        "enable_expert_parallel",
+        "disable_custom_all_reduce",
+    ):
         if key in cfg and cfg[key] is not None:
             kwargs[key] = bool(cfg[key])
     if cfg.get("load_format") is not None:
@@ -412,20 +428,85 @@ def _messages_from_prompts(prompts: list[PromptRow]) -> list[list[dict[str, str]
     return [[{"role": "user", "content": row.prompt_text}] for row in prompts]
 
 
+def _completion_fields_from_request_output(
+    ro: Any,
+) -> tuple[str, int, str | None, float | None, float | None]:
+    """Decode text, n_output_tokens, finish_reason, LDA KL from a ``RequestOutput``."""
+    outs = getattr(ro, "outputs", None) or []
+    if not outs:
+        return "", 0, None, None, None
+    c0 = outs[0]
+    text = getattr(c0, "text", None) or ""
+    tids = getattr(c0, "token_ids", None)
+    n_tok = len(tids) if tids is not None else 0
+    fr = getattr(c0, "finish_reason", None)
+    mean_kl = getattr(c0, "mean_kl_divergence", None)
+    max_kl = getattr(c0, "max_kl_divergence", None)
+    return str(text), int(n_tok), fr, mean_kl, max_kl
+
+
+def _append_generations_jsonl(
+    fh: TextIO,
+    *,
+    prompt_row: PromptRow,
+    response_text: str,
+    scenario: str,
+    lda_alpha: float | None,
+    concurrency: int,
+    repeat_index: int,
+    batch_num: int,
+    finish_reason: str | None,
+    tokens_generated: int,
+    status: str,
+    error: str,
+    mean_kl_divergence: float | None = None,
+    max_kl_divergence: float | None = None,
+) -> None:
+    rec = {
+        "schema_version": 1,
+        "prompt_id": prompt_row.prompt_id,
+        "length_bucket": prompt_row.length_bucket,
+        "prompt_text": prompt_row.prompt_text,
+        "response_text": response_text,
+        "scenario": scenario,
+        "lda_alpha": lda_alpha,
+        "concurrency": concurrency,
+        "repeat_index": repeat_index,
+        "batch_num": batch_num,
+        "finish_reason": finish_reason,
+        "tokens_generated": tokens_generated,
+        "mean_kl_divergence": mean_kl_divergence,
+        "max_kl_divergence": max_kl_divergence,
+        "status": status,
+        "error": error,
+    }
+    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    fh.flush()
+
+
 def _run_one_dataset_pass(
     llm: Any,
     messages: list[list[dict[str, str]]],
+    prompt_rows: list[PromptRow],
     concurrency: int,
     sampling_params: Any,
     *,
     scenario: str,
     repeat_index: int,
     progress_log_every_batch: int = 1,
+    generations_fh: TextIO | None = None,
+    lda_alpha: float | None = None,
 ) -> tuple[float, int, int]:
     """Run all prompts in chunks of ``concurrency``. Optionally log rolling out_tok/s after each batch.
 
     Timers here cover **this repeat’s** ``llm.chat`` calls only (not model load).
+
+    ``prompt_rows`` must align 1:1 with ``messages`` (same order and length).
     """
+    if len(messages) != len(prompt_rows):
+        raise ValueError(
+            f"messages ({len(messages)}) and prompt_rows ({len(prompt_rows)}) length mismatch"
+        )
     t0 = time.perf_counter()
     total_output_tokens = 0
     total_input_tokens = 0
@@ -433,14 +514,46 @@ def _run_one_dataset_pass(
     batch_num = 0
     for i in range(0, n_msg, concurrency):
         batch = messages[i : i + concurrency]
+        batch_prompts = prompt_rows[i : i + concurrency]
         batch_num += 1
         outputs = llm.chat(batch, sampling_params=sampling_params, use_tqdm=False)
-        for out in outputs:
+        if len(outputs) != len(batch_prompts):
+            raise RuntimeError(
+                f"llm.chat returned {len(outputs)} outputs for batch size {len(batch_prompts)}"
+            )
+        for pr, out in zip(batch_prompts, outputs):
+            resp_text, n_out, fin, mean_kl, max_kl = _completion_fields_from_request_output(
+                out
+            )
             if out.outputs:
                 total_output_tokens += len(out.outputs[0].token_ids)
             prompt_token_ids = getattr(out, "prompt_token_ids", None)
             if prompt_token_ids is not None:
                 total_input_tokens += len(prompt_token_ids)
+            if generations_fh is not None:
+                st = "ok"
+                err = ""
+                if not out.outputs:
+                    st = "error"
+                    err = "empty_completion"
+                _append_generations_jsonl(
+                    generations_fh,
+                    prompt_row=pr,
+                    response_text=resp_text,
+                    scenario=scenario,
+                    lda_alpha=lda_alpha,
+                    concurrency=concurrency,
+                    repeat_index=repeat_index,
+                    batch_num=batch_num,
+                    finish_reason=fin,
+                    tokens_generated=n_out,
+                    status=st,
+                    error=err,
+                    mean_kl_divergence=mean_kl,
+                    max_kl_divergence=max_kl,
+                )
+        if generations_fh is not None:
+            _invoke_after_checkpoint_hook()
         n_done = min(i + len(batch), n_msg)
         elapsed = time.perf_counter() - t0
         rate = total_output_tokens / elapsed if elapsed > 0 else 0.0
@@ -498,6 +611,7 @@ def run_scenario(
     continue_on_error: bool,
     on_repeat_result: Any = None,
     progress_log_every_batch: int = 1,
+    generations_fh: TextIO | None = None,
 ) -> tuple[float, list[RepeatResult]]:
     from vllm import LLM
 
@@ -561,11 +675,14 @@ def run_scenario(
                     gen_time_s, out_tokens, in_tokens = _run_one_dataset_pass(
                         llm=llm,
                         messages=messages,
+                        prompt_rows=prompts,
                         concurrency=concurrency,
                         sampling_params=sampling_params,
                         scenario=scenario,
                         repeat_index=repeat_idx,
                         progress_log_every_batch=progress_log_every_batch,
+                        generations_fh=generations_fh,
+                        lda_alpha=ra,
                     )
                     prompts_per_s = len(messages) / gen_time_s if gen_time_s > 0 else 0.0
                     out_tokens_per_s = out_tokens / gen_time_s if gen_time_s > 0 else 0.0
@@ -901,6 +1018,10 @@ def main() -> None:
         else bench_cfg.get("progress_log_every_batches", 1)
     )
 
+    save_generations = bool(bench_cfg.get("save_generations", False))
+    if args.save_generations is not None:
+        save_generations = bool(args.save_generations)
+
     _ALLOWED_SCENARIOS = frozenset({"vanilla", "lda", "lda_kl"})
     default_scenarios = ["vanilla", "lda"]
     scenarios: list[str] = (
@@ -950,6 +1071,10 @@ def main() -> None:
     txt_path = run_dir / "concurrency_speed_tests.txt"
     csv_path = run_dir / "concurrency_speed_tests.csv"
     metadata_path = run_dir / "run_metadata.json"
+    gen_path = run_dir / "generations.jsonl"
+    gen_fh: TextIO | None = None
+    if save_generations:
+        gen_fh = gen_path.open("w", encoding="utf-8")
 
     all_repeat_results: list[RepeatResult] = []
     load_times: dict[str, float] = {}
@@ -977,6 +1102,8 @@ def main() -> None:
         "run_label": args.run_label,
         "progress_log_every_batches": progress_log_every_batch,
         "lda_alphas": lda_alphas,
+        "save_generations": save_generations,
+        "generations_jsonl": str(gen_path) if save_generations else None,
     }
     _write_run_metadata(metadata_path, metadata_payload)
     _invoke_after_checkpoint_hook()
@@ -1035,6 +1162,7 @@ def main() -> None:
                     continue_on_error=continue_on_error,
                     on_repeat_result=_on_repeat_result,
                     progress_log_every_batch=progress_log_every_batch,
+                    generations_fh=gen_fh,
                 )
                 lk = _load_time_meta_key(scenario, cfg_run)
                 load_times[lk] = load_time_s
@@ -1053,10 +1181,28 @@ def main() -> None:
         _write_run_metadata(metadata_path, metadata_payload)
         _invoke_after_checkpoint_hook()
         raise
+    finally:
+        if gen_fh is not None:
+            gen_fh.close()
+        if save_generations and gen_path.is_file():
+            try:
+                metadata_payload["generations_line_count"] = sum(
+                    1 for _ in gen_path.open(encoding="utf-8")
+                )
+            except OSError:
+                metadata_payload["generations_line_count"] = None
+            _write_run_metadata(metadata_path, metadata_payload)
+            _invoke_after_checkpoint_hook()
 
     print(f"\nWrote summary: {txt_path}")
     print(f"Wrote machine-readable: {csv_path}")
     print(f"Wrote run metadata: {metadata_path}")
+    if save_generations and gen_path.is_file():
+        n = metadata_payload.get("generations_line_count")
+        if isinstance(n, int):
+            print(f"Wrote generations JSONL ({n} lines): {gen_path}")
+        else:
+            print(f"Wrote generations JSONL: {gen_path}")
 
 
 if __name__ == "__main__":
