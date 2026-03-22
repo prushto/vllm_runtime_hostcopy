@@ -204,9 +204,13 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         invalid_req_indices: list[int],
         async_output_copy_stream: torch.cuda.Stream,
         vocab_size: int,
+        *,
+        lda_kl_row_snapshot: list[float] | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
+        # Copy taken before the next forward can overwrite runner._lda_kl_row_cpu.
+        self._lda_kl_row_snapshot = lda_kl_row_snapshot
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
         self.async_copy_ready_event = torch.Event()
@@ -260,6 +264,14 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         output = self._model_runner_output
         output.sampled_token_ids = valid_sampled_token_ids
         output.logprobs = logprobs_lists
+        if self._lda_kl_row_snapshot is not None:
+            from vllm.v1.worker.lda_gpu_model_runner import lda_kl_lists_for_export
+
+            output.lda_kl_for_sampled_tokens = lda_kl_lists_for_export(
+                self._lda_kl_row_snapshot,
+                valid_sampled_token_ids,
+                max_gen_len,
+            )
         return output
 
 
@@ -3793,6 +3805,9 @@ class GPUModelRunner(
         with record_function_or_nullcontext(
             "gpu_model_runner: AsyncGPUModelRunnerOutput"
         ):
+            kl_snap = getattr(self, "_lda_kl_row_cpu", None)
+            if kl_snap is not None:
+                kl_snap = list(kl_snap)
             async_output = AsyncGPUModelRunnerOutput(
                 model_runner_output=output,
                 sampled_token_ids=sampler_output.sampled_token_ids,
@@ -3800,6 +3815,7 @@ class GPUModelRunner(
                 invalid_req_indices=invalid_req_indices,
                 async_output_copy_stream=self.async_output_copy_stream,
                 vocab_size=self.input_batch.vocab_size,
+                lda_kl_row_snapshot=kl_snap,
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"

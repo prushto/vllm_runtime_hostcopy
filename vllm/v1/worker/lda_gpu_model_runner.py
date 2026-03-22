@@ -30,6 +30,44 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def lda_kl_lists_for_export(
+    kl_row_cpu: list[float] | None,
+    valid_sampled_token_ids: list[list[int]],
+    max_gen_len: int,
+) -> list[list[float]] | None:
+    """Map per-logits-row KL to per-request lists for one scheduler step.
+
+    Used from sync ``sample_tokens`` and from ``AsyncGPUModelRunnerOutput.get_output``
+    (async scheduling defers CPU token lists until after D2H copy).
+    """
+    if not kl_row_cpu:
+        return None
+    if max_gen_len != 1:
+        logger.warning_once(
+            "LDA KL export skipped: speculative decode (max_gen_len=%s) "
+            "is not supported for per-token KL.",
+            max_gen_len,
+        )
+        return None
+    n_kl = len(kl_row_cpu)
+    n_req = len(valid_sampled_token_ids)
+    if n_req == 0 or n_kl != n_req:
+        logger.warning_once(
+            "LDA KL export skipped: length mismatch (kl_rows=%s, num_reqs=%s).",
+            n_kl,
+            n_req,
+        )
+        return None
+    out: list[list[float]] = []
+    for req_idx in range(n_req):
+        toks = valid_sampled_token_ids[req_idx]
+        if not toks:
+            out.append([])
+        else:
+            out.append([float(kl_row_cpu[req_idx])])
+    return out
+
+
 class LDAGPUModelRunner(GPUModelRunner):
     """GPU model runner that blends logits from main and dormant models (LDA)."""
 
@@ -256,29 +294,10 @@ class LDAGPUModelRunner(GPUModelRunner):
     ) -> list[list[float]] | None:
         """Build per-request KL lists aligned with sampled tokens (non-spec decode only)."""
         del invalid_req_indices  # discard is already reflected as empty token lists
-        if not self._lda_collect_kl or not self._lda_kl_row_cpu:
+        if not self._lda_collect_kl:
             return None
-        if max_gen_len != 1:
-            logger.warning_once(
-                "LDA KL export skipped: speculative decode (max_gen_len=%s) "
-                "is not supported for per-token KL.",
-                max_gen_len,
-            )
-            return None
-        n_kl = len(self._lda_kl_row_cpu)
-        n_req = len(valid_sampled_token_ids)
-        if n_req == 0 or n_kl != n_req:
-            logger.warning_once(
-                "LDA KL export skipped: length mismatch (kl_rows=%s, num_reqs=%s).",
-                n_kl,
-                n_req,
-            )
-            return None
-        out: list[list[float]] = []
-        for req_idx in range(n_req):
-            toks = valid_sampled_token_ids[req_idx]
-            if not toks:
-                out.append([])
-            else:
-                out.append([float(self._lda_kl_row_cpu[req_idx])])
-        return out
+        return lda_kl_lists_for_export(
+            self._lda_kl_row_cpu,
+            valid_sampled_token_ids,
+            max_gen_len,
+        )

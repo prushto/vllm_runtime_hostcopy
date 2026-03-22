@@ -1,0 +1,40 @@
+# Local smoke config: LDA + collect_kl + generations.jsonl (mean/max KL per completion).
+# Used by run_lda_kl_jsonl_check.py — edit model ids for local checkpoint paths if needed.
+#
+# Run (from vllm_runtime_hostcopy with your fork on PYTHONPATH / editable install):
+#   python test/basic_func/run_lda_kl_jsonl_check.py
+#
+# Defaults match test_lda_generate.py style (7B + Jane Street warmup on Hub).
+
+base_model_id: "Qwen/Qwen2.5-7B-Instruct"
+dormant_model_id: "jane-street/dormant-model-warmup"
+lda_alpha: 3.0
+gpu_memory_utilization: 0.4
+max_model_len: 4096
+
+additional_config:
+  lda:
+    collect_kl: true
+
+gen_config:
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
+  repetition_penalty: 1.05
+  max_new_tokens: 32
+  do_sample: true
+
+benchmark:
+  scenarios: ["lda"]
+  n_prompts: 3
+  concurrencies: [1]
+  repeats: 1
+  warmup: false
+  seed: 42
+  continue_on_error: true
+  progress_log_every_batches: 1
+  save_generations: true
+  length_mix:
+    short: 1.0
+    medium: 0.0
+    long: 0.0
