@@ -8,7 +8,7 @@
 
 base_model_id: "Qwen/Qwen2.5-7B-Instruct"
 dormant_model_id: "jane-street/dormant-model-warmup"
-lda_alpha: 3.0
+lda_alpha: 5.0
 gpu_memory_utilization: 0.4
 max_model_len: 4096
 
